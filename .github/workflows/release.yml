@@ -26,6 +26,7 @@ jobs:
       - run: npm test
       - run: npm run package
       - run: node scripts/smoke.mjs
+      - run: node scripts/desktop-smoke.mjs
       - run: node scripts/verify-package.mjs
       - name: Check release version
         env:

@@ -8,3 +8,6 @@
 .github-bridge-history { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--background-modifier-border); }
 .github-bridge-history strong { flex: 1 1 100%; overflow-wrap: anywhere; }
 .github-bridge-history small { flex: 1; color: var(--text-muted); }
+.github-bridge-git-output { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--font-smallest); padding: 12px; background: var(--background-secondary); }
+.github-bridge-preview .setting-item { padding: 8px 0; }
+.github-bridge-preview .setting-item-name { overflow-wrap: anywhere; }

@@ -44,7 +44,8 @@ runInNewContext(await readFile('dist/main.js', 'utf8'), {
 });
 const instance = new module.exports.default();
 await instance.onload();
-assert.equal(commands.length, 7);
+assert.equal(commands.length, 12);
+assert.equal(commands.filter(command => command.checkCallback).every(command => command.checkCallback(true) === false), true, 'Git-only commands are hidden without a local repository');
 assert.equal(events.length, 4);
 assert.equal(instance.settings.token, undefined);
 assert.equal(instance.settings.autoSync, false);
@@ -206,4 +207,26 @@ startup.ready(); startup.plugin.onunload();
 assert.equal(timers.size, 0, 'unload cancels launch');
 startup.ready();
 assert.equal(timers.size, 0, 'late layout-ready cannot restart an unloaded plugin');
-console.log('Browser bundle smoke passed: startup default/opt-out, vault readiness, offline/hidden/busy deferral, coalescing, first approval, unload, 10s idle, Cmd+S, and menu actions.');
+
+// Native menus only exist in repository mode; sync dispatch cannot reach the API.
+const nativeMode = new module.exports.default();
+await nativeMode.onload();
+nativeMode.app.workspace.getActiveViewOfType = () => null;
+let nativeSyncs = 0;
+nativeMode.nativeGit = { root: '/fixture', cancel() {}, snapshot: async () => ({ branch: 'main' }),
+  sync: async () => { nativeSyncs++; return { committed: 1, pushed: 1, pulled: 0 }; } };
+nativeMode.nativeBranch = 'main';
+nativeMode.getContext = () => { throw new Error('Native mode must never invoke the GitHub API engine'); };
+await nativeMode.showSyncMenu(event);
+menu = menus.at(-1);
+for (const title of ['Git 仓库管理', '分支管理', '提交笔记修改', '历史与版本恢复', 'Git 命令行 / Shell']) assert.ok(menu.items.some(item => item.title === title));
+assert.equal(menu.items.some(item => item.title === '预览同步计划'), false);
+assert.ok(commands.slice(-12).filter(command => command.checkCallback).every(command => command.checkCallback(true)));
+await nativeMode.sync(true);
+assert.equal(nativeSyncs, 1);
+assert.match(nativeMode.statusText, /commit 1 ↑1/);
+nativeMode.nativeGit = null;
+await nativeMode.showSyncMenu(event);
+assert.equal(menus.at(-1).items.some(item => item.title === '分支管理'), false);
+nativeMode.onunload();
+console.log('Browser bundle smoke passed: mobile-safe load, conditional Git menus/commands, native-only sync routing, startup queue, 10s idle, Cmd+S, and menu actions.');

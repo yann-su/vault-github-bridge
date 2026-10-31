@@ -1,4 +1,4 @@
-import { App, ButtonComponent, Modal, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
+import { App, ButtonComponent, Modal, Platform, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type GitHubBridgePlugin from './main';
 import type { BridgeSettings } from './main';
 import type { SyncEngine } from './engine';
@@ -24,7 +24,7 @@ export class BridgeSettingsTab extends PluginSettingTab {
 export class SettingsModal extends Modal {
   constructor(app: App, private plugin: GitHubBridgePlugin) { super(app); }
   onOpen(): void {
-    this.setTitle('GitHub 同步设置');
+    this.setTitle(this.plugin.nativeGit ? 'Git 同步设置' : 'GitHub 同步设置');
     renderSettings(this.app, this.plugin, this.contentEl);
   }
 }
@@ -33,12 +33,19 @@ function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): 
   el.empty();
   const draft: BridgeSettings = { ...plugin.settings };
   el.createEl('h2', { text: 'Vault GitHub Bridge' });
-  el.createEl('p', { text: '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
-  new Setting(el).setName('GitHub 用户或组织').addText(t => t.setPlaceholder('your-name').setValue(draft.owner).onChange(v => { draft.owner = v; }));
-  new Setting(el).setName('仓库名称').setDesc('推荐使用专用私有仓库，先勾选添加 README；这里只填仓库名。')
+  el.createEl('p', { text: plugin.nativeGit ? '当前使用本机 Git，跟随仓库的当前分支、上游和本机凭据。自动同步仅提交同步范围内的笔记。' : '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
+  if (plugin.nativeGit) new Setting(el).setName('本机 Git 仓库').setDesc(plugin.nativeGit.root)
+    .addButton(b => b.setButtonText('仓库管理').onClick(() => { void plugin.showNativeRepository(); }));
+  if (plugin.nativeGitError) el.createEl('p', { cls: 'github-bridge-error', text: plugin.nativeGitError });
+  if (Platform.isDesktopApp && (plugin.nativeGit || plugin.nativeGitError)) new Setting(el).setName('Git 可执行文件').setDesc('默认 git；也可填写 Git 程序的完整路径。未检测到笔记库自身的 .git 时使用 GitHub API。')
+    .addText(t => t.setValue(draft.gitExecutable).onChange(v => { draft.gitExecutable = v.trim() || 'git'; }));
+  const connection = plugin.nativeGit ? el.createEl('details') : el;
+  if (plugin.nativeGit) connection.createEl('summary', { text: '无本机 Git 设备使用的 GitHub API 配置' });
+  new Setting(connection).setName('GitHub 用户或组织').addText(t => t.setPlaceholder('your-name').setValue(draft.owner).onChange(v => { draft.owner = v; }));
+  new Setting(connection).setName('仓库名称').setDesc('推荐使用专用私有仓库，先勾选添加 README；这里只填仓库名。')
     .addText(t => t.setPlaceholder('my-notes').setValue(draft.repo).onChange(v => { draft.repo = v; }));
-  new Setting(el).setName('分支').addText(t => t.setValue(draft.branch).onChange(v => { draft.branch = v; }));
-  new Setting(el).setName('GitHub 凭据').setDesc('创建 fine-grained token，仅授权此仓库，Contents：Read and write。只更新模式可用只读权限。凭据不会写入插件 data.json。')
+  new Setting(connection).setName('分支').addText(t => t.setValue(draft.branch).onChange(v => { draft.branch = v; }));
+  new Setting(connection).setName('GitHub 凭据').setDesc('创建 fine-grained token，仅授权此仓库，Contents：Read and write。只更新模式可用只读权限。凭据不会写入插件 data.json。')
     .addComponent(container => new SecretComponent(app, container).setValue(draft.secretName).onChange(v => { draft.secretName = v ?? ''; }));
   new Setting(el).setName('设备名称').setDesc('出现在 GitHub 提交记录中，便于识别修改来自哪台设备。')
     .addText(t => t.setValue(draft.device).onChange(v => { draft.device = v; }));
@@ -48,7 +55,7 @@ function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): 
     .addToggle(t => t.setValue(draft.autoSync).onChange(v => { draft.autoSync = v; }));
   new Setting(el).setName('停止编辑后同步（秒）').setDesc('默认 10 秒。继续输入会重新计时，Obsidian 的自动保存不会延长等待。范围 3～300 秒。')
     .addText(t => t.setValue(String(draft.idleSeconds)).onChange(v => { draft.idleSeconds = Number(v); }));
-  new Setting(el).setName('只接收 GitHub 更新').setDesc('不上传本地修改；本地和远端都修改时仍保留冲突。')
+  new Setting(el).setName('只接收更新').setDesc(plugin.nativeGit ? '只快进接收上游更新，不自动提交或推送。修改仓库的管理操作也会禁用。' : '不上传本地修改；本地和远端都修改时仍保留冲突。')
     .addToggle(t => t.setValue(draft.readOnly).onChange(v => { draft.readOnly = v; }));
   new Setting(el).setName('远端更新检查间隔（秒）').setDesc('检查其他设备在 GitHub 上的新版本，范围 60～3600 秒。本地编辑按上方的等待时间触发同步。')
     .addText(t => t.setValue(String(draft.intervalSeconds)).onChange(v => { draft.intervalSeconds = Number(v); }));
@@ -62,10 +69,10 @@ function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): 
     catch (e) { error.setText(e instanceof Error ? e.message : '保存失败。'); }
   }, true);
   const actions = el.createDiv({ cls: 'github-bridge-actions' });
-  button(actions, '预览同步计划', () => plugin.previewConnection());
+  button(actions, plugin.nativeGit ? 'Git 仓库管理' : '预览同步计划', () => plugin.previewConnection());
   button(actions, '立即同步', () => plugin.sync(true));
   button(actions, '处理冲突', () => plugin.showConflicts());
-  button(actions, '本机恢复版本', () => plugin.showHistory());
+  button(actions, plugin.nativeGit ? 'Git 历史与版本' : '本机恢复版本', () => plugin.showHistory());
   el.createEl('p', { cls: 'setting-item-description', text: '保存后再预览。私有仓库不等于端到端加密；笔记以普通文件存储在 GitHub。当前版本不支持 Git LFS、子模块和插件配置同步。' });
   el.createEl('a', { text: '创建 GitHub fine-grained token', href: 'https://github.com/settings/personal-access-tokens/new', attr: { target: '_blank', rel: 'noopener noreferrer' } });
 }
