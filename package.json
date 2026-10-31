@@ -1,0 +1,24 @@
+{
+  "name": "vault-github-bridge",
+  "version": "0.1.2",
+  "description": "Cross-platform Obsidian vault sync through the GitHub Git Database API.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "build": "npm run check && node esbuild.config.mjs",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "esbuild": "^0.25.5",
+    "fflate": "^0.8.3",
+    "obsidian": "latest",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
+  }
+}

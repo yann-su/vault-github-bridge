@@ -1,0 +1,43 @@
+name: Build and release plugin
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm test
+      - run: npm run package
+      - run: node scripts/smoke.mjs
+      - run: node scripts/verify-package.mjs
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node --input-type=module -e 'import fs from "node:fs"; const m = JSON.parse(fs.readFileSync("manifest.json", "utf8")); if (m.version !== process.env.RELEASE_TAG) throw new Error("Tag does not match manifest version");'
+      - name: Publish release assets for BRAT
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/main.js dist/manifest.json dist/styles.css \
+            release/*.zip release/SHA256SUMS.txt \
+            --verify-tag --title "$RELEASE_TAG" --notes-file RELEASE_NOTES.md
