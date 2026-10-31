@@ -33,12 +33,13 @@ class Menu {
 }
 const module = { exports: {} };
 const api = { Plugin, Menu, Notice: class { constructor(text) { notices.push(text); } }, MarkdownView: class {}, Modal: class {}, PluginSettingTab: class {}, Platform: { isIosApp: false, isAndroidApp: false } };
+const browserDocument = { visibilityState: 'visible' }, browserNavigator = { onLine: true };
 const browserWindow = { setInterval: () => 1, setTimeout: (callback, delay) => { const id = ++timerSequence; timers.set(id, { callback, delay }); return id; }, clearTimeout: id => timers.delete(id) };
 runInNewContext(await readFile('dist/main.js', 'utf8'), {
   module, exports: module.exports,
   require: name => { assert.equal(name, 'obsidian'); return api; },
   TextEncoder, TextDecoder, structuredClone, Uint8Array, btoa, atob,
-  document: { visibilityState: 'visible' },
+  document: browserDocument, navigator: browserNavigator,
   window: browserWindow
 });
 const instance = new module.exports.default();
@@ -47,6 +48,7 @@ assert.equal(commands.length, 7);
 assert.equal(events.length, 4);
 assert.equal(instance.settings.token, undefined);
 assert.equal(instance.settings.autoSync, false);
+assert.equal(instance.settings.syncOnStartup, true);
 assert.ok(!('process' in instance));
 let disk = 'old', syncs = 0;
 instance.settings.autoSync = true; instance.settings.owner = 'fixture'; instance.settings.repo = 'fixture';
@@ -117,4 +119,91 @@ assert.equal(persisted.autoSync, true);
 assert.ok([...timers.values()].some(timer => timer.delay === 1500));
 assert.equal(notices.at(-1), '自动同步已恢复。');
 instance.onunload();
-console.log('Browser bundle smoke passed: 10s idle, Cmd+S save-before-sync, ribbon/status menus, busy actions, and persisted pause/resume.');
+
+// Exercise the real controller, queue and lifecycle with a local engine stand-in.
+async function startupFixture(saved = {}, approved = true) {
+  assert.equal(timers.size, 0);
+  browserDocument.visibilityState = 'visible'; browserNavigator.onLine = true;
+  const plugin = new module.exports.default(), eventStart = domEvents.length;
+  let ready, runs = 0, saves = 0;
+  plugin.loadData = async () => ({ owner: 'fixture', repo: 'fixture', autoSync: false, ...saved });
+  plugin.app.workspace.onLayoutReady = callback => { ready = callback; };
+  plugin.app.workspace.getActiveViewOfType = () => ({ file: { path: 'note.md' }, save: async () => { saves++; } });
+  plugin.getContext = () => ({ engine: {
+    inspect: async () => ({ approved, conflicts: [] }),
+    run: async () => { assert.ok(saves > 0, 'startup flushes the editor before reading files'); runs++; return { uploaded: 0, downloaded: 0, conflicts: 0, deferred: 0 }; }
+  } });
+  await plugin.onload();
+  assert.equal(timers.size, 0, 'wait for vault layout before scheduling startup');
+  return { plugin, ready: () => ready(), get runs() { return runs; },
+    emit(name) { const event = domEvents.slice(eventStart).find(event => event.name === name); assert.ok(event); event.callback(); }
+  };
+}
+async function fireTimer(delay) {
+  const timer = [...timers].find(([, entry]) => entry.delay === delay);
+  assert.ok(timer, `expected a ${delay}ms timer`);
+  timers.delete(timer[0]); timer[1].callback();
+  await new Promise(resolve => setImmediate(resolve));
+}
+let startup = await startupFixture();
+startup.ready(); startup.ready();
+assert.equal(timers.size, 1, 'duplicate layout-ready callbacks coalesce');
+await fireTimer(1500); await fireTimer(0);
+assert.equal(startup.runs, 1, 'legacy settings launch once even when edit auto-sync is paused');
+startup.emit('focus'); startup.emit('online');
+assert.equal(timers.size, 0, 'one launch does not become recurring auto-sync');
+startup.plugin.onunload();
+
+startup = await startupFixture({ syncOnStartup: false });
+startup.ready(); startup.emit('focus');
+assert.equal(timers.size, 0, 'disabled startup stays disabled');
+startup.plugin.onunload();
+
+startup = await startupFixture({ autoSync: true });
+startup.ready();
+const launchTimer = [...timers.keys()][0];
+workspaceEvents.at(-1).cb({}, { file: { path: 'note.md' } });
+startup.emit('focus'); startup.emit('online');
+assert.ok(timers.has(launchTimer), 'typing and foreground events do not postpone or duplicate startup');
+assert.equal(timers.size, 1);
+await fireTimer(1500); await fireTimer(0);
+assert.equal(startup.runs, 1);
+startup.plugin.onunload();
+
+startup = await startupFixture();
+browserDocument.visibilityState = 'hidden'; browserNavigator.onLine = false;
+startup.ready(); await fireTimer(1500);
+assert.equal(startup.runs, 0);
+browserNavigator.onLine = true; startup.emit('online'); await fireTimer(1000);
+assert.equal(startup.runs, 0, 'online alone does not sync a hidden vault');
+browserDocument.visibilityState = 'visible'; startup.emit('visibilitychange');
+await fireTimer(1000); await fireTimer(0);
+assert.equal(startup.runs, 1, 'deferred launch runs on return to an online foreground');
+startup.plugin.onunload();
+
+startup = await startupFixture();
+startup.ready();
+let finishSettingsSave;
+startup.plugin.saveData = () => new Promise(resolve => { finishSettingsSave = resolve; });
+const settingsSave = startup.plugin.toggleAutoSync();
+assert.equal(startup.plugin.busy, true);
+await fireTimer(1500);
+assert.equal(startup.runs, 0);
+finishSettingsSave(); await settingsSave;
+await fireTimer(0);
+assert.equal(startup.runs, 1, 'launch stays queued until a busy task completes');
+assert.equal(timers.size, 0);
+startup.plugin.onunload();
+
+startup = await startupFixture({}, false);
+startup.ready(); await fireTimer(1500); await fireTimer(0);
+assert.equal(startup.runs, 0, 'first connection approval is never bypassed');
+assert.equal(startup.plugin.statusText, '请先预览并建立连接');
+startup.plugin.onunload();
+
+startup = await startupFixture();
+startup.ready(); startup.plugin.onunload();
+assert.equal(timers.size, 0, 'unload cancels launch');
+startup.ready();
+assert.equal(timers.size, 0, 'late layout-ready cannot restart an unloaded plugin');
+console.log('Browser bundle smoke passed: startup default/opt-out, vault readiness, offline/hidden/busy deferral, coalescing, first approval, unload, 10s idle, Cmd+S, and menu actions.');

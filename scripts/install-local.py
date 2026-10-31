@@ -58,6 +58,7 @@ if not data_file.exists():
         "branch": "main",
         "secretName": "vault-github-bridge",
         "device": "Mac",
+        "syncOnStartup": True,
         "autoSync": False,
         "readOnly": False,
         "intervalSeconds": 90,

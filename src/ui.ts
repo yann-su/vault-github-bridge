@@ -42,6 +42,8 @@ function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): 
     .addComponent(container => new SecretComponent(app, container).setValue(draft.secretName).onChange(v => { draft.secretName = v ?? ''; }));
   new Setting(el).setName('设备名称').setDesc('出现在 GitHub 提交记录中，便于识别修改来自哪台设备。')
     .addText(t => t.setValue(draft.device).onChange(v => { draft.device = v; }));
+  new Setting(el).setName('打开 Obsidian 后同步').setDesc('默认开启。笔记库加载完成后同步一次，独立于下方的自动同步开关。离线或在后台时，联网并返回前台后执行；首次连接仍需预览确认。')
+    .addToggle(t => t.setValue(draft.syncOnStartup).onChange(v => { draft.syncOnStartup = v; }));
   new Setting(el).setName('自动同步').setDesc('停止编辑后自动同步，Cmd+S / Ctrl+S 保存后立即同步。已在同步时会排队补传。移动端关闭应用后无法保证后台同步。')
     .addToggle(t => t.setValue(draft.autoSync).onChange(v => { draft.autoSync = v; }));
   new Setting(el).setName('停止编辑后同步（秒）').setDesc('默认 10 秒。继续输入会重新计时，Obsidian 的自动保存不会延长等待。范围 3～300 秒。')
@@ -99,6 +101,7 @@ export class StatusModal extends Modal {
     this.contentEl.createEl('p', { text: this.plugin.statusText });
     this.contentEl.createEl('p', { text: `仓库：${this.plugin.settings.owner}/${this.plugin.settings.repo} · ${this.plugin.settings.branch}` });
     this.contentEl.createEl('p', { text: this.plugin.settings.autoSync ? `自动同步：开启，停止编辑 ${this.plugin.settings.idleSeconds} 秒后同步。` : '自动同步：已暂停，仍可手动同步。' });
+    this.contentEl.createEl('p', { text: `打开 Obsidian 后同步：${this.plugin.settings.syncOnStartup ? '开启' : '关闭'}` });
     const actions = this.contentEl.createDiv({ cls: 'github-bridge-actions' });
     button(actions, '立即同步', async () => { this.close(); await this.plugin.sync(true); }, true);
     button(actions, '预览同步计划', async () => { this.close(); await this.plugin.previewConnection(); });

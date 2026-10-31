@@ -13,6 +13,7 @@ export interface BridgeSettings {
   branch: string;
   secretName: string;
   device: string;
+  syncOnStartup: boolean;
   autoSync: boolean;
   readOnly: boolean;
   intervalSeconds: number;
@@ -22,7 +23,7 @@ export interface BridgeSettings {
 }
 export const DEFAULT_SETTINGS: BridgeSettings = {
   owner: '', repo: '', branch: 'main', secretName: 'vault-github-bridge',
-  device: '我的设备', autoSync: false, readOnly: false,
+  device: '我的设备', syncOnStartup: true, autoSync: false, readOnly: false,
   intervalSeconds: 90, idleSeconds: 10, maxFileMB: 10, excludedFolders: ''
 };
 interface Context { engine: SyncEngine; local: ObsidianLocal; store: DiskStateStore; scope: Scope }
@@ -40,6 +41,7 @@ export default class GitHubBridgePlugin extends Plugin {
   private failures = 0;
   private unloaded = false;
   private startupPending = true;
+  private launchSyncPending = false;
   private lastConflictSignature = '';
   private saveQueue!: SaveSyncQueue;
   private lastEditorChange: { path: string; at: number } | null = null;
@@ -58,8 +60,8 @@ export default class GitHubBridgePlugin extends Plugin {
     this.ribbon = this.addRibbonIcon('git-pull-request', 'GitHub：打开同步菜单', event => this.showSyncMenu(event));
     this.setStatus(this.configured() ? '等待同步' : '尚未连接');
     this.saveQueue = new SaveSyncQueue({
-      enabled: () => this.settings.autoSync && this.configured() && !this.unloaded && !this.startupPending,
-      busy: () => this.busy,
+      enabled: () => (this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) && this.configured() && !this.unloaded && !this.startupPending,
+      busy: () => this.busy || document.visibilityState !== 'visible' || !navigator.onLine,
       retryAt: () => this.blockedUntil,
       now: () => Date.now(),
       setTimer: (callback, delay) => window.setTimeout(callback, delay),
@@ -113,10 +115,17 @@ export default class GitHubBridgePlugin extends Plugin {
     this.registerInterval(window.setInterval(() => {
       if (Date.now() >= this.nextPoll && document.visibilityState === 'visible') this.schedule(1000, false);
     }, 15_000));
-    this.app.workspace.onLayoutReady(() => { this.startupPending = false; this.schedule(1500); });
+    this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded || !this.startupPending) return;
+      this.startupPending = false;
+      this.nextPoll = Date.now() + this.settings.intervalSeconds * 1000;
+      this.launchSyncPending = this.settings.syncOnStartup && this.configured();
+      if (this.launchSyncPending) this.schedule(1500);
+    });
   }
   onunload(): void {
     this.unloaded = true;
+    this.launchSyncPending = false;
     window.clearTimeout(this.debounce);
     this.context?.engine.cancel();
     this.saveQueue?.cancel();
@@ -159,6 +168,7 @@ export default class GitHubBridgePlugin extends Plugin {
       const next = { ...this.settings, autoSync: !this.settings.autoSync };
       await this.saveData(next);
       this.settings = next;
+      if (!next.autoSync) this.launchSyncPending = false;
       window.clearTimeout(this.debounce); this.debounce = undefined;
       this.saveQueue.wake();
       this.setStatus(this.statusText);
@@ -218,14 +228,15 @@ export default class GitHubBridgePlugin extends Plugin {
     return this.context;
   }
   private schedule(delay: number, replace = true): void {
-    if (this.unloaded || this.startupPending || !this.settings.autoSync || !this.configured()) return;
+    if (this.unloaded || this.startupPending || !(this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) || !this.configured()) return;
     if (this.debounce !== undefined) {
-      if (!replace) return;
+      // Keep the launch deadline even if the user starts typing immediately.
+      if (!replace || this.launchSyncPending) return;
       window.clearTimeout(this.debounce);
     }
     this.debounce = window.setTimeout(() => {
       this.debounce = undefined;
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState !== 'visible' || !navigator.onLine) return;
       void this.saveQueue.request(async () => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (view?.file && inScope(view.file.path, this.scope())) await view.save();
@@ -255,6 +266,10 @@ export default class GitHubBridgePlugin extends Plugin {
     if (Date.now() < this.blockedUntil) {
       if (manual) new Notice(`请等待约 ${Math.ceil((this.blockedUntil - Date.now()) / 1000)} 秒后重试。`);
       return;
+    }
+    if (this.launchSyncPending) {
+      this.launchSyncPending = false;
+      window.clearTimeout(this.debounce); this.debounce = undefined;
     }
     this.busy = true;
     try {
