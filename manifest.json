@@ -1,7 +1,7 @@
 {
   "id": "vault-github-bridge",
   "name": "Vault GitHub Bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "1.11.5",
   "description": "通过 GitHub 同步笔记：跨平台、离线编辑、冲突保留与恢复。",
   "author": "Vault GitHub Bridge contributors",

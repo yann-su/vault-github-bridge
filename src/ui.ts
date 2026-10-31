@@ -17,43 +17,55 @@ function button(el: HTMLElement, label: string, action: () => Promise<void> | vo
 export class BridgeSettingsTab extends PluginSettingTab {
   constructor(app: App, private plugin: GitHubBridgePlugin) { super(app, plugin); }
   display(): void {
-    const el = this.containerEl; el.empty();
-    const draft: BridgeSettings = { ...this.plugin.settings };
-    el.createEl('h2', { text: 'Vault GitHub Bridge' });
-    el.createEl('p', { text: '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
-    new Setting(el).setName('GitHub 用户或组织').addText(t => t.setPlaceholder('your-name').setValue(draft.owner).onChange(v => { draft.owner = v; }));
-    new Setting(el).setName('仓库名称').setDesc('推荐使用专用私有仓库，先勾选添加 README；这里只填仓库名。')
-      .addText(t => t.setPlaceholder('my-notes').setValue(draft.repo).onChange(v => { draft.repo = v; }));
-    new Setting(el).setName('分支').addText(t => t.setValue(draft.branch).onChange(v => { draft.branch = v; }));
-    new Setting(el).setName('GitHub 凭据').setDesc('创建 fine-grained token，仅授权此仓库，Contents：Read and write。只更新模式可用只读权限。凭据不会写入插件 data.json。')
-      .addComponent(container => new SecretComponent(this.app, container).setValue(draft.secretName).onChange(v => { draft.secretName = v ?? ''; }));
-    new Setting(el).setName('设备名称').setDesc('出现在 GitHub 提交记录中，便于识别修改来自哪台设备。')
-      .addText(t => t.setValue(draft.device).onChange(v => { draft.device = v; }));
-    new Setting(el).setName('自动同步').setDesc('停止编辑后自动同步，Cmd+S / Ctrl+S 保存后立即同步。已在同步时会排队补传。移动端关闭应用后无法保证后台同步。')
-      .addToggle(t => t.setValue(draft.autoSync).onChange(v => { draft.autoSync = v; }));
-    new Setting(el).setName('停止编辑后同步（秒）').setDesc('默认 10 秒。继续输入会重新计时，Obsidian 的自动保存不会延长等待。范围 3～300 秒。')
-      .addText(t => t.setValue(String(draft.idleSeconds)).onChange(v => { draft.idleSeconds = Number(v); }));
-    new Setting(el).setName('只接收 GitHub 更新').setDesc('不上传本地修改；本地和远端都修改时仍保留冲突。')
-      .addToggle(t => t.setValue(draft.readOnly).onChange(v => { draft.readOnly = v; }));
-    new Setting(el).setName('远端更新检查间隔（秒）').setDesc('检查其他设备在 GitHub 上的新版本，范围 60～3600 秒。本地编辑按上方的等待时间触发同步。')
-      .addText(t => t.setValue(String(draft.intervalSeconds)).onChange(v => { draft.intervalSeconds = Number(v); }));
-    new Setting(el).setName('单文件上限（MB）').setDesc('1～20 MB，默认 10 MB。遇到超限文件会停止本轮同步，而非将其当成删除。')
-      .addText(t => t.setValue(String(draft.maxFileMB)).onChange(v => { draft.maxFileMB = Number(v); }));
-    new Setting(el).setName('排除文件夹').setDesc('相对于笔记库根目录，一行一条，不使用通配符。隐藏目录和 Obsidian 配置目录始终排除。改变范围后需要重新预览。')
-      .addTextArea(t => t.setValue(draft.excludedFolders).setPlaceholder('私人资料\n大附件').onChange(v => { draft.excludedFolders = v; }));
-    const error = el.createEl('p', { cls: 'github-bridge-error' });
-    button(el, '保存配置', async () => {
-      try { await this.plugin.configure(draft); error.setText('配置已保存。'); }
-      catch (e) { error.setText(e instanceof Error ? e.message : '保存失败。'); }
-    }, true);
-    const actions = el.createDiv({ cls: 'github-bridge-actions' });
-    button(actions, '预览同步计划', () => this.plugin.previewConnection());
-    button(actions, '立即同步', () => this.plugin.sync(true));
-    button(actions, '处理冲突', () => this.plugin.showConflicts());
-    button(actions, '本机恢复版本', () => this.plugin.showHistory());
-    el.createEl('p', { cls: 'setting-item-description', text: '保存后再预览。私有仓库不等于端到端加密；笔记以普通文件存储在 GitHub。当前版本不支持 Git LFS、子模块和插件配置同步。' });
-    el.createEl('a', { text: '创建 GitHub fine-grained token', href: 'https://github.com/settings/personal-access-tokens/new', attr: { target: '_blank', rel: 'noopener noreferrer' } });
+    renderSettings(this.app, this.plugin, this.containerEl);
   }
+}
+
+export class SettingsModal extends Modal {
+  constructor(app: App, private plugin: GitHubBridgePlugin) { super(app); }
+  onOpen(): void {
+    this.setTitle('GitHub 同步设置');
+    renderSettings(this.app, this.plugin, this.contentEl);
+  }
+}
+
+function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): void {
+  el.empty();
+  const draft: BridgeSettings = { ...plugin.settings };
+  el.createEl('h2', { text: 'Vault GitHub Bridge' });
+  el.createEl('p', { text: '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
+  new Setting(el).setName('GitHub 用户或组织').addText(t => t.setPlaceholder('your-name').setValue(draft.owner).onChange(v => { draft.owner = v; }));
+  new Setting(el).setName('仓库名称').setDesc('推荐使用专用私有仓库，先勾选添加 README；这里只填仓库名。')
+    .addText(t => t.setPlaceholder('my-notes').setValue(draft.repo).onChange(v => { draft.repo = v; }));
+  new Setting(el).setName('分支').addText(t => t.setValue(draft.branch).onChange(v => { draft.branch = v; }));
+  new Setting(el).setName('GitHub 凭据').setDesc('创建 fine-grained token，仅授权此仓库，Contents：Read and write。只更新模式可用只读权限。凭据不会写入插件 data.json。')
+    .addComponent(container => new SecretComponent(app, container).setValue(draft.secretName).onChange(v => { draft.secretName = v ?? ''; }));
+  new Setting(el).setName('设备名称').setDesc('出现在 GitHub 提交记录中，便于识别修改来自哪台设备。')
+    .addText(t => t.setValue(draft.device).onChange(v => { draft.device = v; }));
+  new Setting(el).setName('自动同步').setDesc('停止编辑后自动同步，Cmd+S / Ctrl+S 保存后立即同步。已在同步时会排队补传。移动端关闭应用后无法保证后台同步。')
+    .addToggle(t => t.setValue(draft.autoSync).onChange(v => { draft.autoSync = v; }));
+  new Setting(el).setName('停止编辑后同步（秒）').setDesc('默认 10 秒。继续输入会重新计时，Obsidian 的自动保存不会延长等待。范围 3～300 秒。')
+    .addText(t => t.setValue(String(draft.idleSeconds)).onChange(v => { draft.idleSeconds = Number(v); }));
+  new Setting(el).setName('只接收 GitHub 更新').setDesc('不上传本地修改；本地和远端都修改时仍保留冲突。')
+    .addToggle(t => t.setValue(draft.readOnly).onChange(v => { draft.readOnly = v; }));
+  new Setting(el).setName('远端更新检查间隔（秒）').setDesc('检查其他设备在 GitHub 上的新版本，范围 60～3600 秒。本地编辑按上方的等待时间触发同步。')
+    .addText(t => t.setValue(String(draft.intervalSeconds)).onChange(v => { draft.intervalSeconds = Number(v); }));
+  new Setting(el).setName('单文件上限（MB）').setDesc('1～20 MB，默认 10 MB。遇到超限文件会停止本轮同步，而非将其当成删除。')
+    .addText(t => t.setValue(String(draft.maxFileMB)).onChange(v => { draft.maxFileMB = Number(v); }));
+  new Setting(el).setName('排除文件夹').setDesc('相对于笔记库根目录，一行一条，不使用通配符。隐藏目录和 Obsidian 配置目录始终排除。改变范围后需要重新预览。')
+    .addTextArea(t => t.setValue(draft.excludedFolders).setPlaceholder('私人资料\n大附件').onChange(v => { draft.excludedFolders = v; }));
+  const error = el.createEl('p', { cls: 'github-bridge-error' });
+  button(el, '保存配置', async () => {
+    try { await plugin.configure(draft); error.setText('配置已保存。'); }
+    catch (e) { error.setText(e instanceof Error ? e.message : '保存失败。'); }
+  }, true);
+  const actions = el.createDiv({ cls: 'github-bridge-actions' });
+  button(actions, '预览同步计划', () => plugin.previewConnection());
+  button(actions, '立即同步', () => plugin.sync(true));
+  button(actions, '处理冲突', () => plugin.showConflicts());
+  button(actions, '本机恢复版本', () => plugin.showHistory());
+  el.createEl('p', { cls: 'setting-item-description', text: '保存后再预览。私有仓库不等于端到端加密；笔记以普通文件存储在 GitHub。当前版本不支持 Git LFS、子模块和插件配置同步。' });
+  el.createEl('a', { text: '创建 GitHub fine-grained token', href: 'https://github.com/settings/personal-access-tokens/new', attr: { target: '_blank', rel: 'noopener noreferrer' } });
 }
 
 export class PreviewModal extends Modal {
@@ -86,6 +98,7 @@ export class StatusModal extends Modal {
     this.setTitle('GitHub 同步状态');
     this.contentEl.createEl('p', { text: this.plugin.statusText });
     this.contentEl.createEl('p', { text: `仓库：${this.plugin.settings.owner}/${this.plugin.settings.repo} · ${this.plugin.settings.branch}` });
+    this.contentEl.createEl('p', { text: this.plugin.settings.autoSync ? `自动同步：开启，停止编辑 ${this.plugin.settings.idleSeconds} 秒后同步。` : '自动同步：已暂停，仍可手动同步。' });
     const actions = this.contentEl.createDiv({ cls: 'github-bridge-actions' });
     button(actions, '立即同步', async () => { this.close(); await this.plugin.sync(true); }, true);
     button(actions, '预览同步计划', async () => { this.close(); await this.plugin.previewConnection(); });

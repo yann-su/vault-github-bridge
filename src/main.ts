@@ -1,10 +1,10 @@
-import { MarkdownView, Notice, Platform, Plugin, requestUrl } from 'obsidian';
+import { MarkdownView, Menu, Notice, Platform, Plugin, requestUrl } from 'obsidian';
 import { SyncEngine, type SyncResult } from './engine';
 import { GitHubError, GitHubRemote, type Transport } from './github';
 import { DEFAULT_EXTENSIONS, hashText, inScope, safePath, type Conflict, type HistoryEntry, type Scope } from './model';
 import { ObsidianLocal, ensureVaultFolder } from './obsidian-local';
 import { arrayBuffer, DiskStateStore } from './storage';
-import { BridgeSettingsTab, ConflictsModal, HistoryModal, PreviewModal, StatusModal } from './ui';
+import { BridgeSettingsTab, ConflictsModal, HistoryModal, PreviewModal, SettingsModal, StatusModal } from './ui';
 import { isSaveShortcut, SaveSyncQueue } from './save-sync';
 
 export interface BridgeSettings {
@@ -54,8 +54,8 @@ export default class GitHubBridgePlugin extends Plugin {
     if (!saved?.device) this.settings.device = Platform.isIosApp ? 'iPhone 或 iPad' : Platform.isAndroidApp ? 'Android' : '电脑';
     this.statusEl = this.addStatusBarItem();
     this.statusEl.addClass('github-bridge-status');
-    this.statusEl.addEventListener('click', () => { new StatusModal(this.app, this).open(); });
-    this.ribbon = this.addRibbonIcon('git-pull-request', 'GitHub：立即同步', () => { void this.sync(true); });
+    this.statusEl.addEventListener('click', event => this.showSyncMenu(event));
+    this.ribbon = this.addRibbonIcon('git-pull-request', 'GitHub：打开同步菜单', event => this.showSyncMenu(event));
     this.setStatus(this.configured() ? '等待同步' : '尚未连接');
     this.saveQueue = new SaveSyncQueue({
       enabled: () => this.settings.autoSync && this.configured() && !this.unloaded && !this.startupPending,
@@ -80,6 +80,8 @@ export default class GitHubBridgePlugin extends Plugin {
     this.addCommand({ id: 'show-conflicts', name: '处理同步冲突', callback: () => { void this.showConflicts(); } });
     this.addCommand({ id: 'show-history', name: '查看本机恢复版本', callback: () => { void this.showHistory(); } });
     this.addCommand({ id: 'show-status', name: '查看同步状态', callback: () => { new StatusModal(this.app, this).open(); } });
+    this.addCommand({ id: 'show-menu', name: '打开同步菜单', callback: () => this.showSyncMenu() });
+    this.addCommand({ id: 'open-settings', name: '打开同步设置', callback: () => this.showSettings() });
     const edited = (path: string, fromEditor = false) => {
       if (!this.settings.autoSync || !this.configured()) return;
       if (!inScope(path, this.scope())) return;
@@ -122,8 +124,47 @@ export default class GitHubBridgePlugin extends Plugin {
   setStatus(message: string): void {
     this.statusText = message;
     if (this.unloaded) return;
-    this.statusEl?.setText(`GitHub · ${message}`);
-    this.ribbon?.setAttribute('aria-label', `GitHub：${message}（点击同步）`);
+    const label = `${message}${this.settings.autoSync ? '' : ' · 自动同步已暂停'}`;
+    this.statusEl?.setText(`GitHub · ${label}`);
+    this.ribbon?.setAttribute('aria-label', `GitHub：${label}（点击打开同步菜单）`);
+  }
+  showSyncMenu(event?: MouseEvent): void {
+    const menu = new Menu().setUseNativeMenu(false);
+    menu.addItem(item => item.setTitle(`GitHub：${this.statusText}`).setDisabled(true));
+    menu.addSeparator();
+    menu.addItem(item => item.setTitle(this.busy ? '正在同步，请稍候…' : '立即同步').setIcon('refresh-cw')
+      .setDisabled(this.busy || !this.configured()).onClick(() => this.sync(true)));
+    menu.addItem(item => item.setTitle('查看同步状态').setIcon('info').onClick(() => { new StatusModal(this.app, this).open(); }));
+    menu.addItem(item => item.setTitle('预览同步计划').setIcon('list-checks').setDisabled(this.busy || !this.configured())
+      .onClick(() => this.previewConnection()));
+    menu.addSeparator();
+    menu.addItem(item => item.setTitle('处理同步冲突').setIcon('git-merge').setDisabled(this.busy || !this.configured())
+      .onClick(() => this.showConflicts()));
+    menu.addItem(item => item.setTitle('查看本机恢复版本').setIcon('history').setDisabled(this.busy || !this.configured())
+      .onClick(() => this.showHistory()));
+    menu.addSeparator();
+    menu.addItem(item => item.setTitle(this.settings.autoSync ? '暂停自动同步' : '恢复自动同步')
+      .setIcon(this.settings.autoSync ? 'pause' : 'play').setDisabled(this.busy || !this.configured())
+      .onClick(() => this.toggleAutoSync()));
+    menu.addItem(item => item.setTitle('同步设置').setIcon('settings').onClick(() => this.showSettings()));
+    if (event) menu.showAtMouseEvent(event);
+    else {
+      const rect = this.ribbon.getBoundingClientRect();
+      menu.showAtPosition({ x: rect.right, y: rect.bottom }, this.ribbon.ownerDocument);
+    }
+  }
+  showSettings(): void { new SettingsModal(this.app, this).open(); }
+  async toggleAutoSync(): Promise<void> {
+    await this.task(async () => {
+      const next = { ...this.settings, autoSync: !this.settings.autoSync };
+      await this.saveData(next);
+      this.settings = next;
+      window.clearTimeout(this.debounce); this.debounce = undefined;
+      this.saveQueue.wake();
+      this.setStatus(this.statusText);
+      if (next.autoSync) this.schedule(1500);
+      new Notice(next.autoSync ? '自动同步已恢复。' : '自动同步已暂停，仍可手动同步。');
+    });
   }
   configured(): boolean { return Boolean(this.settings.owner && this.settings.repo && this.settings.branch); }
   private scope(settings = this.settings): Scope {
@@ -221,7 +262,7 @@ export default class GitHubBridgePlugin extends Plugin {
       const { engine } = this.getContext();
       if (!(await engine.inspect()).approved) {
         this.setStatus('请先预览并建立连接');
-        if (manual) new Notice('请到插件设置，点击“预览首次同步”。');
+        if (manual) new Notice('请打开同步菜单，点击“预览同步计划”建立首次连接。');
         return;
       }
       const result = await engine.run();
@@ -230,7 +271,7 @@ export default class GitHubBridgePlugin extends Plugin {
       this.setStatus(this.describe(result));
       if (manual && notifySuccess) new Notice(this.statusText, 6000);
       const signature = result.conflicts ? JSON.stringify((await engine.inspect()).conflicts.map(c => [c.path, c.local, c.remote])) : '';
-      if (!manual && signature && signature !== this.lastConflictSignature) new Notice(`GitHub：${result.conflicts} 项冲突已保留双方内容。请通过命令面板选择“处理同步冲突”。`, 8000);
+      if (!manual && signature && signature !== this.lastConflictSignature) new Notice(`GitHub：${result.conflicts} 项冲突已保留双方内容。请打开同步菜单选择“处理同步冲突”。`, 8000);
       this.lastConflictSignature = signature;
     } catch (error) {
       this.failures++;
