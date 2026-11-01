@@ -17,7 +17,7 @@ function setup() {
   const fs = new MemoryFS(), cache = new MemoryStore();
   const files = new Map<string, any>();
   let processRace: (() => Promise<void>) | undefined;
-  let focused = false, active: string | null = null;
+  let focused = false, active: string | null = null, editorValue = 'active editor';
   const vault: any = {
     adapter: fs,
     getFiles: () => [...files.values()].filter(f => f instanceof host.TFile),
@@ -28,10 +28,10 @@ function setup() {
     modifyBinary: async (f: any, bytes: ArrayBuffer) => fs.writeBinary(f.path, bytes),
     trash: async (f: any) => { fs.files.delete(f.path); files.delete(f.path); }
   };
-  const app = { vault, workspace: { getActiveViewOfType: () => active ? { file: { path: active }, editor: { hasFocus: () => focused, getValue: () => 'active editor' } } : null } };
+  const app = { vault, workspace: { getActiveViewOfType: () => active ? { file: { path: active }, editor: { hasFocus: () => focused, getValue: () => editorValue } } : null } };
   const local = new host.ObsidianLocal(app, cache);
   const set = async (path: string, text: string) => { await fs.write(path, text); files.set(path, new host.TFile(path)); };
-  return { fs, cache, local, set, race: (cb: () => Promise<void>) => { processRace = cb; }, active: (path: string, value: boolean) => { active = path; focused = value; } };
+  return { fs, cache, local, set, race: (cb: () => Promise<void>) => { processRace = cb; }, active: (path: string, value: boolean, text = 'active editor') => { active = path; focused = value; editorValue = text; } };
 }
 test('real Obsidian adapter process guard refuses a write racing with newer text', async () => {
   const d = setup(); await d.set('a.md', 'base'); d.race(() => d.fs.write('a.md', 'new typing'));
@@ -61,4 +61,14 @@ test('real Obsidian adapter preserves bytes before deletion', async () => {
 test('real Obsidian adapter creates nested new files', async () => {
   const d = setup(); assert.equal(await d.local.apply('folder/a.md', null, encode('download')), true);
   assert.equal(await d.fs.read('folder/a.md'), 'download'); assert.ok(d.fs.folders.has('folder'));
+});
+test('confirmed force can update a saved focused editor through Vault.process', async () => {
+  const d = setup(); await d.set('a.md', 'base'); d.active('a.md', true, 'base');
+  assert.equal(await d.local.apply('a.md', blobHash(encode('base')), encode('remote'), true), true);
+  assert.equal(await d.fs.read('a.md'), 'remote');
+});
+test('confirmed force still refuses new unsaved editor text', async () => {
+  const d = setup(); await d.set('a.md', 'base'); d.active('a.md', true, 'new unsaved typing');
+  assert.equal(await d.local.apply('a.md', blobHash(encode('base')), encode('remote'), true), false);
+  assert.equal(await d.fs.read('a.md'), 'base');
 });

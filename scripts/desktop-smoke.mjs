@@ -33,7 +33,7 @@ try {
   }
   class Modal {
     contentEl = element(); setTitle(title) { modalTitles.push(title); }
-    constructor(app) { this.app = app; } open() { this.onOpen(); } close() {}
+    constructor(app) { this.app = app; } open() { this.onOpen(); } close() { this.onClose?.(); }
   }
   class FileSystemAdapter { getBasePath() { return root; } }
   class Plugin {
@@ -118,7 +118,37 @@ try {
     await plugin.showNativeConflicts();
     const conflict = await plugin.nativeGit.conflict('note.md');
     assert.equal(conflict.ours, 'local conflict'); assert.equal(conflict.theirs, 'remote conflict');
+    await writeFile(join(root, 'local-only.md'), 'local draft to back up');
+    const beforeForce = await git('rev-parse', 'HEAD');
+    let savedViews = 0;
+    plugin.app.workspace.getLeavesOfType = () => ['note.md', 'local-only.md'].map(path => ({ view: { file: { path }, save: async () => { savedViews++; } } }));
+    await plugin.previewForceRemote();
+    assert.equal(savedViews, 2, 'preview saves all open note editors');
+    assert.equal(modalTitles.at(-1), '强制采用远端内容');
+    assert.equal(await git('rev-parse', 'HEAD'), beforeForce, 'force preview is read-only');
+    const realSync = plugin.nativeGit.sync;
+    plugin.nativeGit.sync = async () => { throw new Error('force preview must pause background sync'); };
+    await plugin.sync(false);
+    assert.match(plugin.statusText, /预览已就绪/);
+    plugin.nativeGit.sync = realSync;
+    const realForce = plugin.nativeGit.forceRemote;
+    let continueForce;
+    const pause = new Promise(resolve => { continueForce = resolve; });
+    plugin.nativeGit.forceRemote = async plan => { await pause; return realForce.call(plugin.nativeGit, plan); };
+    const applying = buttons.findLast(b => b.label === '备份并用远端覆盖本地').click();
+    await new Promise(resolve => setImmediate(resolve));
+    plugin.forceModal.close();
+    assert.equal(plugin.forceReview, true, 'closing an in-progress force cannot resume background uploads');
+    continueForce(); await applying; plugin.nativeGit.forceRemote = realForce;
+    assert.equal(savedViews, 4, 'confirmation saves all open note editors again before revalidation');
+    assert.match(plugin.statusText, /已采用远端/);
+    assert.equal(plugin.forceReview, false);
+    assert.equal(await git('rev-parse', 'HEAD'), remoteHead);
+    assert.equal(await readFile(join(root, 'note.md'), 'utf8'), 'remote conflict');
+    await assert.rejects(readFile(join(root, 'local-only.md')), { code: 'ENOENT' });
+    assert.equal(await readFile(join(root, '.obsidian/workspace.json'), 'utf8'), '{"layout":"running app"}');
+    assert.equal((await exec('git', ['-C', remote, 'rev-parse', 'refs/heads/main'])).stdout.trim(), remoteHead);
   } finally { await rm(network, { recursive: true, force: true }); }
   plugin.onunload();
-  console.log('Desktop bundle smoke passed: lazy Node/Git detection, seven panels, metadata reads preserve HEAD/index; workspace repair buttons preserve running app JSON, merge notes and push through a real bare remote; genuine note conflicts retain both sides.');
+  console.log('Desktop bundle smoke passed: lazy Git detection and panels; layout repair, genuine conflicts, force preview pauses background sync, confirmed remote overwrite aligns HEAD without pushing and keeps local layout.');
 } finally { await rm(root, { recursive: true, force: true }); }

@@ -22,13 +22,14 @@ export class ObsidianLocal implements LocalPort {
     if (!await adapter.exists(path)) return null;
     return new Uint8Array(await adapter.readBinary(path));
   }
-  async apply(path: string, expected: Hash, data: Uint8Array | null): Promise<boolean> {
+  async apply(path: string, expected: Hash, data: Uint8Array | null, forceFocused = false): Promise<boolean> {
     const vault = this.app.vault;
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     // Never replace the active editor, including text not yet flushed to the filesystem.
-    if (view?.file?.path === path && (view.editor.hasFocus() || data === null)) return false;
+    if (!forceFocused && view?.file?.path === path && (view.editor.hasFocus() || data === null)) return false;
     const before = await this.read(path), actual = before === null ? null : blobHash(before);
     if (actual !== expected) return false;
+    if (view?.file?.path === path && blobHash(encode(view.editor.getValue())) !== expected) return false;
     if (before) await this.cache.put(before);
     let file = vault.getAbstractFileByPath(path);
     if (file && !(file instanceof TFile)) throw new Error(`目标路径不是文件：${path}`);

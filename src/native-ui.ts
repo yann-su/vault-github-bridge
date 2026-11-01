@@ -29,6 +29,7 @@ export class NativeRepositoryModal extends Modal {
     if (s.operation) el.createEl('p', { cls: 'github-bridge-error', text: `正在进行：${s.operation}，完成前暂停自动同步。` });
     const actions = el.createDiv({ cls: 'github-bridge-actions' });
     action(actions, '立即同步', async () => { this.close(); await this.plugin.sync(true); }, true);
+    action(actions, '强制采用远端内容…', async () => { this.close(); await this.plugin.previewForceRemote(); });
     action(actions, '提交笔记修改', async () => { this.close(); await this.plugin.showNativeCommit(); });
     action(actions, '分支管理', async () => { this.close(); await this.plugin.showNativeBranches(); });
     action(actions, '历史与版本恢复', async () => { this.close(); await this.plugin.showNativeVersions(); });

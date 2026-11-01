@@ -159,9 +159,13 @@ export class ConflictsModal extends Modal {
 }
 
 export class HistoryModal extends Modal {
-  constructor(app: App, private plugin: GitHubBridgePlugin, private entries: HistoryEntry[]) { super(app); }
+  constructor(app: App, private plugin: GitHubBridgePlugin, private entries: HistoryEntry[], private backups: Array<{ id: string; at: string }> = []) { super(app); }
   onOpen(): void {
     this.setTitle('本机恢复版本');
+    for (const backup of [...this.backups].reverse()) {
+      new Setting(this.contentEl).setName('强制覆盖前完整备份').setDesc(backup.at)
+        .addButton(b => b.setButtonText('查看备份文件').onClick(() => { void this.plugin.showForceBackup(backup.id); }));
+    }
     this.contentEl.createEl('p', { text: '显示当前仓库连接最近 200 条本机版本记录。恢复会另存为新文件，不覆盖当前笔记；GitHub 完整提交历史可在仓库查看。' });
     if (!this.entries.length) this.contentEl.createEl('p', { text: '完成首次同步后会出现版本记录。' });
     for (const entry of [...this.entries].reverse()) {

@@ -1,4 +1,7 @@
 import { blobHash, hashText, inScope, type Scope } from './model';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
+import { overwritePlan, type RemoteOverwritePlan, type RemoteOverwriteResult } from './force-remote';
 
 export interface NativeRuntime {
   fs: typeof import('node:fs/promises');
@@ -126,6 +129,8 @@ export class NativeGit {
       try { await this.runtime.fs.stat(this.runtime.path.resolve(this.root, location)); operation = label; break; }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
     }
+    try { await this.runtime.fs.stat(this.runtime.path.join(this.gitDir, 'vault-bridge-force-remote.json')); operation = 'force-remote'; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     const fields = branch ? (await this.text(['for-each-ref', '--format=%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)', `refs/heads/${branch}`])).trim().split('\0') : [];
     const upstream = fields[0] ?? '', remote = fields[1] || 'origin', upstreamRef = fields[2] ?? '';
     if (remote.startsWith('-') || /[\0\r\n\s]/.test(remote)) throw new Error('Git 远端名称无效。');
@@ -135,6 +140,7 @@ export class NativeGit {
       behind: Number(counts[1]) || 0, operation, changes };
   }
   private ensureIdle(state: GitSnapshot): void {
+    if (state.operation === 'force-remote') throw new Error('上次强制采用远端尚未完成，请从同步菜单重新预览。备份已保留，自动上传已停止。');
     const conflicts = state.changes.filter(c => c.conflict);
     if (conflicts.length) throw new Error(`Git 有 ${conflicts.length} 个未解决冲突：${conflicts.slice(0, 3).map(c => c.path).join('、')}。请先处理冲突。`);
     if (state.operation) throw new Error(`Git 正在进行 ${state.operation}，请先完成或在终端中处理该操作。`);
@@ -191,6 +197,7 @@ export class NativeGit {
   }
   async sync(device: string, readOnly = false): Promise<GitSyncResult> {
     let state = await this.snapshot();
+    if (state.operation === 'force-remote') this.ensureIdle(state);
     const result: GitSyncResult = { committed: 0, pulled: 0, pushed: 0, merged: false,
       conflicts: state.changes.filter(c => c.conflict).length, divergent: false, noUpstream: false };
     if (result.conflicts) return result;
@@ -415,6 +422,126 @@ export class NativeGit {
       paths.push(file);
     }
     return paths;
+  }
+  private repoHash(bytes: Uint8Array, head: string): string {
+    if (head.length === 40) return blobHash(bytes);
+    const header = new TextEncoder().encode(`blob ${bytes.length}\0`), data = new Uint8Array(header.length + bytes.length);
+    data.set(header); data.set(bytes, header.length); return bytesToHex(sha256(data));
+  }
+  private forceState(state: GitSnapshot): void {
+    if (state.operation && !['merge', 'force-remote'].includes(state.operation)) throw new Error(`请先在终端完成或退出 ${state.operation}，再采用远端。`);
+    if (!state.branch || !state.head || !state.upstream || !state.upstreamRef || state.remote === '.') throw new Error('强制采用远端需要当前本地分支已设置远端上游。');
+    if (state.changes.some(c => !c.managed && c.index !== ' ' && c.index !== '?')) throw new Error('同步范围外有已暂存修改或冲突，请先处理；强制覆盖不会丢弃这些文件。');
+  }
+  private async forceTree(sha: string): Promise<Map<string, { sha: string; mode: number }>> {
+    const files = new Map<string, { sha: string; mode: number }>();
+    for (const entry of (await this.text(['ls-tree', '-rlz', sha])).split('\0').filter(Boolean)) {
+      const tab = entry.indexOf('\t'), file = entry.slice(tab + 1), fields = entry.slice(0, tab).trim().split(/\s+/);
+      if (!inScope(file, this.scope)) continue;
+      if (tab < 0 || fields[1] !== 'blob' || !['100644', '100755'].includes(fields[0]!) || !/^[a-f\d]{40,64}$/.test(fields[2]!)) throw new Error(`不支持强制覆盖的远端路径：${file}`);
+      if (!Number.isFinite(Number(fields[3])) || Number(fields[3]) > this.scope.maxBytes) throw new Error(`远端文件超过同步上限：${file}`);
+      files.set(file, { sha: fields[2]!, mode: fields[0] === '100755' ? 0o100 : 0 });
+    }
+    return files;
+  }
+  private async forceLocal(state: GitSnapshot, target: Map<string, { sha: string; mode: number }>): Promise<Map<string, { sha: string; mode: number }>> {
+    const paths = new Set([...await this.treePaths(state.head), ...target.keys(),
+      ...(await this.text(['ls-files', '--cached', '--others', '--exclude-standard', '-z'])).split('\0').filter(p => p && inScope(p, this.scope))]);
+    const files = new Map<string, { sha: string; mode: number }>();
+    for (const file of paths) {
+      await this.checkFiles([file]);
+      try {
+        const full = this.runtime.path.join(this.root, file), stat = await this.runtime.fs.stat(full);
+        const bytes = new Uint8Array(await this.runtime.fs.readFile(full));
+        files.set(file, { sha: this.repoHash(bytes, state.head), mode: stat.mode & 0o111 ? 0o100 : 0 });
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    return files;
+  }
+  async previewForceRemote(): Promise<RemoteOverwritePlan> {
+    const before = await this.snapshot(); this.forceState(before);
+    await this.text(['fetch', '--prune', before.remote]);
+    const state = await this.snapshot(); this.forceState(state);
+    if (state.branch !== before.branch || state.upstream !== before.upstream || state.remote !== before.remote) throw new Error('分支或上游已变化，请重新预览。');
+    const remoteHead = await this.resolveVersion(state.upstream), remote = await this.forceTree(remoteHead), local = await this.forceLocal(state, remote);
+    const hashes = (files: Map<string, { sha: string }>) => new Map([...files].map(([p, v]) => [p, v.sha]));
+    const extra = [...remote].filter(([p, v]) => local.has(p) && local.get(p)!.mode !== v.mode).map(([p]) => p).sort();
+    return overwritePlan({ mode: 'git', source: `${state.remoteUrl} · ${state.upstream}（本地分支：${state.branch}）`, remoteHead, localHead: state.head,
+      localCommits: state.ahead, stagedPaths: state.changes.filter(c => c.managed && c.index !== ' ' && c.index !== '?').map(c => c.path).sort() },
+      hashes(local), hashes(remote), [this.root, this.scope, state.branch, state.upstream, state.upstreamRef, state.remoteUrl, state.operation,
+        await this.text(['ls-files', '--stage', '-z']), [...local].sort(), [...remote].sort()], extra);
+  }
+  async forceRemote(expected: RemoteOverwritePlan): Promise<RemoteOverwriteResult> {
+    const plan = await this.previewForceRemote();
+    if (plan.fingerprint !== expected.fingerprint) throw new Error('本地笔记、暂存区、分支或远端已变化，请重新预览远端覆盖。');
+    const state = await this.snapshot(); this.forceState(state);
+    const target = await this.forceTree(plan.remoteHead), local = await this.forceLocal(state, target);
+    const parent = this.runtime.path.join(this.gitDir, 'vault-bridge-backups');
+    await this.runtime.fs.mkdir(parent, { recursive: true });
+    const backup = await this.runtime.fs.mkdtemp(this.runtime.path.join(parent, 'remote-'));
+    const saveBackup = async (file: string, bytes: Uint8Array) => {
+      const full = this.runtime.path.join(backup, file);
+      await this.runtime.fs.mkdir(this.runtime.path.dirname(full), { recursive: true });
+      const handle = await this.runtime.fs.open(full, 'w', 0o600);
+      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+      if (this.repoHash(new Uint8Array(await this.runtime.fs.readFile(full)), state.head) !== this.repoHash(bytes, state.head)) throw new Error('备份文件校验失败，已停止覆盖。');
+    };
+    for (const [file, value] of local) {
+      const bytes = new Uint8Array(await this.runtime.fs.readFile(this.runtime.path.join(this.root, file)));
+      if (this.repoHash(bytes, state.head) !== value.sha) throw new Error('笔记在备份时变化，请重新预览。');
+      await saveBackup(this.runtime.path.join('files', file), bytes);
+    }
+    const indexPath = (await this.text(['rev-parse', '--git-path', 'index'])).trim();
+    await saveBackup('index', new Uint8Array(await this.runtime.fs.readFile(this.runtime.path.resolve(this.root, indexPath))));
+    const staged = await this.text(['ls-files', '--stage', '-z']);
+    for (const entry of staged.split('\0').filter(Boolean)) {
+      const tab = entry.indexOf('\t'), file = entry.slice(tab + 1), sha = entry.slice(0, tab).split(' ')[1]!;
+      if (!plan.stagedPaths.includes(file)) continue;
+      await saveBackup(this.runtime.path.join('index-blobs', sha), await this.raw(['cat-file', 'blob', sha]));
+    }
+    await saveBackup('manifest.json', new TextEncoder().encode(JSON.stringify({ version: 1, plan, local: [...local], staged })));
+    // Verify the complete review again after the backup, before changing HEAD.
+    if ((await this.previewForceRemote()).fingerprint !== plan.fingerprint) throw new Error('备份期间本地或远端已变化，请重新预览。');
+    const backupBranch = `vault-bridge-backup/${Date.now()}-${this.runtime.path.basename(backup)}`;
+    await this.text(['branch', backupBranch, plan.localHead]);
+    const marker = this.runtime.path.join(this.gitDir, 'vault-bridge-force-remote.json');
+    const savedMarker = this.runtime.path.join(backup, 'pending.json');
+    await saveBackup('pending.json', new TextEncoder().encode(JSON.stringify({ backup, backupBranch, remoteHead: plan.remoteHead })));
+    await this.runtime.fs.rename(savedMarker, marker);
+    // Mixed reset aligns the branch/index without touching settings or layouts.
+    await this.text(['reset', '--mixed', '--quiet', plan.remoteHead]);
+    for (const change of plan.changes) {
+      if (this.cancelled) throw new Error('强制覆盖已取消，备份已保留，请重新预览。');
+      await this.checkFiles([change.path]);
+      const full = this.runtime.path.join(this.root, change.path);
+      let before: Uint8Array | null = null;
+      try { before = new Uint8Array(await this.runtime.fs.readFile(full)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      if ((before === null ? null : this.repoHash(before, plan.remoteHead)) !== change.before) throw new Error('覆盖期间笔记被编辑，已停止。请重新预览；备份及原提交已保留。');
+      if (this.cancelled) throw new Error('强制覆盖已取消，备份已保留，请重新预览。');
+      if (change.target === null) await this.runtime.fs.unlink(full);
+      else {
+        const bytes = await this.raw(['cat-file', 'blob', change.target]);
+        if (this.repoHash(bytes, plan.remoteHead) !== change.target) throw new Error('远端文件校验失败，已停止。');
+        await this.runtime.fs.mkdir(this.runtime.path.dirname(full), { recursive: true });
+        const temp = await this.runtime.fs.mkdtemp(this.runtime.path.join(this.runtime.path.dirname(full), '.vault-bridge-force-'));
+        try {
+          const file = this.runtime.path.join(temp, 'file');
+          await this.runtime.fs.writeFile(file, bytes, { mode: target.get(change.path)!.mode ? 0o700 : 0o600 });
+          let latest: Uint8Array | null = null;
+          try { latest = new Uint8Array(await this.runtime.fs.readFile(full)); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          if (this.cancelled || (latest === null ? null : this.repoHash(latest, plan.remoteHead)) !== change.before) throw new Error('覆盖期间笔记变化或操作取消，请重新预览；备份已保留。');
+          await this.runtime.fs.rename(file, full);
+        } finally { await this.runtime.fs.rm(temp, { recursive: true, force: true }); }
+      }
+    }
+    await this.text(['fetch', '--prune', state.remote]);
+    if (await this.resolveVersion(state.upstream) !== plan.remoteHead) throw new Error('远端在覆盖期间更新，请重新预览；备份已保留。');
+    const final = await this.snapshot(), files = await this.forceLocal(final, target);
+    if (final.branch !== state.branch || final.upstream !== state.upstream || final.head !== plan.remoteHead || final.changes.some(c => c.index !== ' ' && c.index !== '?') || files.size !== target.size || [...target].some(([p, v]) => files.get(p)?.sha !== v.sha || files.get(p)?.mode !== v.mode)) throw new Error('覆盖期间笔记、暂存区或分支已变化，请重新预览；备份已保留。');
+    await this.runtime.fs.unlink(marker);
+    return { changed: plan.changes.length, backup, backupBranch };
   }
   async restorePlan(version: string): Promise<GitRestorePlan> {
     const state = await this.snapshot(); this.ensureIdle(state);

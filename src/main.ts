@@ -8,6 +8,8 @@ import { BridgeSettingsTab, ConflictsModal, HistoryModal, PreviewModal, Settings
 import { isSaveShortcut, SaveSyncQueue } from './save-sync';
 import { NativeGit } from './native-git';
 import { NativeBranchesModal, NativeCommitModal, NativeConflictsModal, NativeConsoleModal, NativeRepositoryModal, NativeVersionsModal } from './native-ui';
+import { ForceBackupModal, ForceRemoteModal } from './force-ui';
+import type { RemoteOverwritePlan } from './force-remote';
 
 export interface BridgeSettings {
   owner: string;
@@ -52,6 +54,8 @@ export default class GitHubBridgePlugin extends Plugin {
   private startupPending = true;
   private launchSyncPending = false;
   private lastConflictSignature = '';
+  private forceReview = false;
+  private forceModal: ForceRemoteModal | null = null;
   private saveQueue!: SaveSyncQueue;
   private lastEditorChange: { path: string; at: number } | null = null;
 
@@ -71,7 +75,7 @@ export default class GitHubBridgePlugin extends Plugin {
     this.setStatus(this.nativeGitError || (this.configured() ? '等待同步' : '尚未连接'));
     this.saveQueue = new SaveSyncQueue({
       enabled: () => !this.apiNeedsReview && (this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) && this.configured() && !this.unloaded && !this.startupPending,
-      busy: () => this.busy || this.detectingGit || document.visibilityState !== 'visible' || !navigator.onLine,
+      busy: () => this.busy || this.detectingGit || this.forceReview || document.visibilityState !== 'visible' || !navigator.onLine,
       retryAt: manual => this.retryAt(manual),
       now: () => Date.now(),
       setTimer: (callback, delay) => window.setTimeout(callback, delay),
@@ -89,6 +93,7 @@ export default class GitHubBridgePlugin extends Plugin {
     });
     this.addSettingTab(new BridgeSettingsTab(this.app, this));
     this.addCommand({ id: 'sync-now', name: '立即同步', callback: () => { void this.sync(true); } });
+    this.addCommand({ id: 'force-remote', name: '强制采用远端内容（预览）', callback: () => { void this.previewForceRemote(); } });
     this.addCommand({ id: 'preview-connection', name: '预览同步计划', callback: () => { void this.previewConnection(); } });
     this.addCommand({ id: 'show-conflicts', name: '处理同步冲突', callback: () => { void this.showConflicts(); } });
     this.addCommand({ id: 'show-history', name: '查看本机恢复版本', callback: () => { void this.showHistory(); } });
@@ -147,6 +152,7 @@ export default class GitHubBridgePlugin extends Plugin {
   }
   onunload(): void {
     this.unloaded = true;
+    this.forceModal?.close(true); this.forceModal = null;
     this.launchSyncPending = false;
     window.clearTimeout(this.debounce);
     this.context?.engine.cancel();
@@ -162,13 +168,15 @@ export default class GitHubBridgePlugin extends Plugin {
     this.ribbon?.setAttribute('aria-label', `${mode}：${label}（点击打开同步菜单）`);
   }
   async showSyncMenu(event?: MouseEvent): Promise<void> {
-    if (!this.busy && Platform.isDesktopApp) await this.detectNativeGit();
+    if (!this.busy && !this.forceReview && Platform.isDesktopApp) await this.detectNativeGit();
     const menu = new Menu().setUseNativeMenu(false);
     const mode = this.nativeGit ? `Git · ${this.nativeBranch || '分离 HEAD'}` : this.nativeGitError ? '本机 Git 不可用' : 'GitHub';
     menu.addItem(item => item.setTitle(`${mode}：${this.statusText.slice(0, 120)}`).setDisabled(true));
     menu.addSeparator();
     menu.addItem(item => item.setTitle(this.busy ? '正在同步，请稍候…' : '立即同步').setIcon('refresh-cw')
       .setDisabled(this.busy || !this.configured()).onClick(() => this.sync(true)));
+    menu.addItem(item => item.setTitle('强制采用远端内容…').setIcon('download-cloud')
+      .setDisabled(this.busy || this.forceReview || !this.configured()).onClick(() => this.previewForceRemote()));
     menu.addItem(item => item.setTitle('查看同步状态').setIcon('info').onClick(() => this.showStatus()));
     if (this.nativeGit) {
       menu.addItem(item => item.setTitle('Git 仓库管理').setIcon('folder-git-2').setDisabled(this.busy).onClick(() => this.showNativeRepository()));
@@ -243,6 +251,12 @@ export default class GitHubBridgePlugin extends Plugin {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (view?.file) await view.save();
   }
+  private async saveForceEditors(): Promise<void> {
+    const views = new Set(this.app.workspace.getLeavesOfType?.('markdown').map(leaf => leaf.view as MarkdownView) ?? []);
+    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (active) views.add(active);
+    for (const view of views) if (view.file && inScope(view.file.path, this.scope())) await view.save();
+  }
   async nativeAction<T>(job: (git: NativeGit) => Promise<T>, write = false): Promise<T | undefined> {
     return this.task(async () => {
       if (!this.nativeGit) throw new Error('当前笔记库没有可用的本机 Git 仓库。');
@@ -284,6 +298,7 @@ export default class GitHubBridgePlugin extends Plugin {
     };
   }
   async configure(settings: BridgeSettings): Promise<void> {
+    if (this.forceReview) throw new Error('请先关闭远端覆盖预览，再修改配置。');
     if (this.busy) throw new Error('同步正在进行，请完成后再保存配置。');
     const next = { ...settings, owner: settings.owner.trim(), repo: settings.repo.trim(), branch: settings.branch.trim(), secretName: settings.secretName.trim(), device: settings.device.trim() };
     if (!Number.isFinite(next.intervalSeconds) || next.intervalSeconds < 60 || next.intervalSeconds > 3600) throw new Error('检查间隔应为 60～3600 秒。');
@@ -329,7 +344,7 @@ export default class GitHubBridgePlugin extends Plugin {
     return this.context;
   }
   private schedule(delay: number, replace = true): void {
-    if (this.unloaded || this.startupPending || this.apiNeedsReview || !(this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) || !this.configured()) return;
+    if (this.unloaded || this.startupPending || this.forceReview || this.apiNeedsReview || !(this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) || !this.configured()) return;
     if (this.debounce !== undefined) {
       // Keep the launch deadline even if the user starts typing immediately.
       if (!replace || this.launchSyncPending) return;
@@ -348,11 +363,13 @@ export default class GitHubBridgePlugin extends Plugin {
     const server = this.nativeGit || this.nativeGitError ? 0 : this.rateLimitedUntil;
     return manual ? server : Math.max(server, this.blockedUntil);
   }
-  private async task<T>(job: () => Promise<T>): Promise<T | undefined> {
+  private async task<T>(job: () => Promise<T>, duringForceReview = false): Promise<T | undefined> {
+    if (this.forceReview && !duringForceReview) { new Notice('请先确认或取消远端覆盖预览。'); return; }
     if (this.busy || this.detectingGit) { new Notice('已有操作正在进行，请稍候。'); return; }
     this.busy = true;
     try { return await job(); }
     catch (error) {
+      this.recordRateLimit(error);
       const message = error instanceof Error ? error.message : '操作失败。';
       this.setStatus(message);
       new Notice(message, 8000);
@@ -364,9 +381,15 @@ export default class GitHubBridgePlugin extends Plugin {
     if (result.deferred) return `${result.deferred} 项待下轮同步，↑${result.uploaded} ↓${result.downloaded}`;
     return `${this.settings.readOnly ? '已检查更新' : '已同步'} · ↑${result.uploaded} ↓${result.downloaded}`;
   }
+  private recordRateLimit(error: unknown): void {
+    if (error instanceof GitHubError && Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
+      this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + error.retryAfterMs);
+    }
+  }
   async sync(manual: boolean, notifySuccess = true): Promise<void> {
     let continueQueue = false;
     if (this.startupPending || this.unloaded) return;
+    if (this.forceReview) { if (manual) new Notice('请先确认或取消远端覆盖预览。'); return; }
     if (this.busy || this.detectingGit) { if (manual) new Notice('已有同步正在进行。'); return; }
     const retryAt = this.retryAt(manual);
     if (Date.now() < retryAt) {
@@ -417,9 +440,7 @@ export default class GitHubBridgePlugin extends Plugin {
     } catch (error) {
       this.failures++;
       this.blockedUntil = Date.now() + Math.min(900_000, 30_000 * 2 ** Math.min(this.failures - 1, 5));
-      if (error instanceof GitHubError && Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
-        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + error.retryAfterMs);
-      }
+      this.recordRateLimit(error);
       const message = error instanceof Error ? error.message : '同步失败，请稍后重试。';
       this.setStatus(message);
       if (manual) new Notice(message, 8000);
@@ -429,6 +450,62 @@ export default class GitHubBridgePlugin extends Plugin {
       this.saveQueue.wake();
       if (continueQueue) this.schedule(this.settings.idleSeconds * 1000);
     }
+  }
+  async previewForceRemote(): Promise<void> {
+    if (this.busy || this.detectingGit || this.forceReview || this.unloaded) { new Notice('请先完成当前操作。'); return; }
+    this.forceReview = true;
+    window.clearTimeout(this.debounce); this.debounce = undefined;
+    this.saveQueue.wake();
+    const plan = await this.task(async () => {
+      if (Date.now() < this.retryAt(true)) throw new Error('GitHub 正在限流，请等待服务端期限后再预览。');
+      await this.saveForceEditors();
+      this.setStatus('正在预览远端覆盖…');
+      if (this.nativeGit) return this.nativeGit.previewForceRemote();
+      if (this.nativeGitError || this.apiNeedsReview) throw new Error(this.nativeGitError || '本地 Git 已移除，请先确认 API 连接。');
+      const plan = await this.getContext().engine.previewForceRemote();
+      return { ...plan, source: `${this.settings.owner}/${this.settings.repo} · ${this.settings.branch}` };
+    }, true);
+    if (!plan || this.unloaded) { this.endForceRemoteReview(); return; }
+    this.setStatus('远端覆盖预览已就绪，等待确认；自动同步暂缓');
+    this.forceModal = new ForceRemoteModal(this.app, this, plan); this.forceModal.open();
+  }
+  endForceRemoteReview(): void {
+    this.forceReview = false; this.forceModal = null;
+    this.saveQueue?.wake();
+    if (!this.unloaded && !this.busy) {
+      if (this.statusText.startsWith('远端覆盖预览已就绪')) this.setStatus('已取消远端覆盖');
+      this.schedule(this.settings.idleSeconds * 1000);
+    }
+  }
+  async applyForceRemote(plan: RemoteOverwritePlan): Promise<boolean> {
+    if (this.unloaded || !this.forceReview) return false;
+    const result = await this.task(async () => {
+      this.saveQueue.clearPending();
+      await this.saveForceEditors();
+      this.setStatus('正在备份并采用远端内容…');
+      if (plan.mode === 'git') {
+        if (!this.nativeGit) throw new Error('本机 Git 模式已变化，请重新预览。');
+        return this.nativeGit.forceRemote(plan);
+      }
+      if (this.nativeGit || this.nativeGitError) throw new Error('同步模式已变化，请重新预览。');
+      return this.getContext().engine.forceRemote(plan);
+    }, true);
+    if (!result) return false;
+    this.launchSyncPending = false; this.failures = 0; this.blockedUntil = 0;
+    this.lastConflictSignature = ''; this.nextPoll = Date.now() + this.settings.intervalSeconds * 1000;
+    this.setStatus(`已采用远端 · 更新 ${result.changed} 个笔记文件`);
+    new Notice(`已采用远端内容。备份：${result.backup}${result.backupBranch ? `\n备份分支：${result.backupBranch}` : ''}`, 12_000);
+    return true;
+  }
+  async showForceBackup(id: string): Promise<void> {
+    const backup = await this.task(async () => {
+      const bytes = await this.getContext().engine.cached(id);
+      if (!bytes) throw new Error('找不到完整备份清单。');
+      const data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+      if (data.version !== 1 || !Array.isArray(data.files) || data.files.some((f: { path: string; sha: string }) => !safePath(f.path) || !inScope(f.path, this.scope()) || !/^[a-f\d]{40}$/.test(f.sha))) throw new Error('备份清单无效。');
+      return data as { at: string; files: Array<{ path: string; sha: string }> };
+    });
+    if (backup) new ForceBackupModal(this.app, this, backup.files, backup.at).open();
   }
   async previewConnection(): Promise<void> {
     if (this.nativeGit) { await this.showNativeRepository(); return; }
@@ -493,7 +570,7 @@ export default class GitHubBridgePlugin extends Plugin {
   }
   async showHistory(): Promise<void> {
     if (this.nativeGit) { await this.showNativeVersions(); return; }
-    const result = await this.task(async () => (await this.getContext().engine.inspect()).history);
-    if (result) new HistoryModal(this.app, this, result).open();
+    const result = await this.task(async () => this.getContext().engine.inspect());
+    if (result) new HistoryModal(this.app, this, result.history, result.forceBackups).open();
   }
 }

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import * as child from 'node:child_process';
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
+import type { PathLike } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { NativeGit, parseGitCommand, parseGitStatus, redactGit } from '../src/native-git';
@@ -16,11 +17,11 @@ const exec = promisify(child.execFile);
 async function git(root: string, ...args: string[]): Promise<string> {
   return (await exec('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })).stdout.trim();
 }
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, format = 'sha1') {
   const dir = await fs.mkdtemp(path.join(tmpdir(), 'vault-bridge-git-test-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const root = path.join(dir, 'vault'); await fs.mkdir(root);
-  await git(root, 'init', '-b', 'main');
+  await git(root, 'init', '-b', 'main', ...(format === 'sha256' ? ['--object-format=sha256'] : []));
   await git(root, 'config', 'user.name', 'Bridge Test'); await git(root, 'config', 'user.email', 'bridge@example.invalid');
   await git(root, 'config', 'commit.gpgsign', 'false');
   await fs.writeFile(path.join(root, 'note.md'), 'base\n');
@@ -30,9 +31,9 @@ async function fixture(t: TestContext) {
   const write = (name: string, content: string | Uint8Array) => fs.writeFile(path.join(root, name), content);
   return { dir, root, native, write };
 }
-async function networkFixture(t: TestContext) {
-  const f = await fixture(t), remote = path.join(f.dir, 'origin.git'), peer = path.join(f.dir, 'peer');
-  await git(f.dir, 'init', '--bare', remote);
+async function networkFixture(t: TestContext, format = 'sha1') {
+  const f = await fixture(t, format), remote = path.join(f.dir, 'origin.git'), peer = path.join(f.dir, 'peer');
+  await git(f.dir, 'init', '--bare', ...(format === 'sha256' ? ['--object-format=sha256'] : []), remote);
   await git(f.root, 'remote', 'add', 'origin', remote); await git(f.root, 'push', '-u', 'origin', 'main');
   await git(f.dir, 'clone', '-b', 'main', remote, peer);
   await git(peer, 'config', 'user.name', 'Peer'); await git(peer, 'config', 'user.email', 'peer@example.invalid');
@@ -428,4 +429,116 @@ test('symlink parents and historical symlinks are refused for note operations', 
   await fs.unlink(path.join(f.root, 'folder')); await git(f.root, 'restore', 'folder');
   await fs.symlink('note.md', path.join(f.root, 'link.md')); await git(f.root, 'add', 'link.md'); await git(f.root, 'commit', '-m', 'symlink');
   await assert.rejects(f.native.restorePlan('HEAD'), /符号链接/);
+});
+
+test('force remote backs up commits, staged and working notes; aligns HEAD without pushing or changing settings', async t => {
+  const f = await networkFixture(t);
+  await f.write('local-only.md', 'local commit'); await f.native.commit('local unpublished');
+  const oldHead = await git(f.root, 'rev-parse', 'HEAD');
+  await f.write('note.md', 'staged version'); await git(f.root, 'add', 'note.md'); const staged = await git(f.root, 'rev-parse', ':note.md');
+  await f.write('note.md', 'working version'); await f.write('scratch.md', 'untracked note'); await f.write('.private.json', 'local setting');
+  await fs.mkdir(path.join(f.root, '.obsidian')); await f.write('.obsidian/workspace.json', '{"local":"layout"}');
+  await fs.writeFile(path.join(f.peer, 'note.md'), 'remote note'); await fs.writeFile(path.join(f.peer, 'download.md'), 'download');
+  await fs.writeFile(path.join(f.peer, '.private.json'), 'remote setting');
+  await git(f.peer, 'add', '.'); await git(f.peer, 'commit', '-m', 'remote updates'); await git(f.peer, 'push');
+  const head = await git(f.peer, 'rev-parse', 'HEAD'), plan = await f.native.previewForceRemote();
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), oldHead, 'preview never resets HEAD');
+  const result = await f.native.forceRemote(plan);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head); assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), head);
+  assert.equal(await git(f.root, 'rev-parse', result.backupBranch!), oldHead);
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'remote note');
+  assert.equal(await fs.readFile(path.join(f.root, '.private.json'), 'utf8'), 'local setting');
+  assert.equal(await fs.readFile(path.join(f.root, '.obsidian/workspace.json'), 'utf8'), '{"local":"layout"}');
+  await assert.rejects(fs.stat(path.join(f.root, 'scratch.md')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(f.root, 'local-only.md')), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(path.join(result.backup, 'files/note.md'), 'utf8'), 'working version');
+  assert.equal(await fs.readFile(path.join(result.backup, 'index-blobs', staged), 'utf8'), 'staged version');
+  assert.equal(await fs.readFile(path.join(result.backup, 'files/scratch.md'), 'utf8'), 'untracked note');
+  assert.equal((await f.native.sync('fixture')).pushed, 0, 'normal sync cannot republish discarded local commits');
+});
+test('force remote can replace an unresolved note merge while preserving all conflict versions', async t => {
+  const f = await networkFixture(t); await f.write('note.md', 'local conflict'); await f.native.commit('local');
+  await fs.writeFile(path.join(f.peer, 'note.md'), 'remote conflict'); await git(f.peer, 'commit', '-am', 'remote'); await git(f.peer, 'push');
+  assert.equal((await f.native.sync('fixture')).conflicts, 1);
+  const result = await f.native.forceRemote(await f.native.previewForceRemote());
+  assert.equal((await f.native.snapshot()).operation, ''); assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'remote conflict');
+  assert.match(await fs.readFile(path.join(result.backup, 'files/note.md'), 'utf8'), /<<<<<<< /);
+  assert.ok((await fs.readdir(path.join(result.backup, 'index-blobs'))).length >= 3);
+});
+test('force remote refuses stale local and remote plans before any reset', async t => {
+  const f = await networkFixture(t), old = await git(f.root, 'rev-parse', 'HEAD'), plan = await f.native.previewForceRemote();
+  await f.write('new.md', 'new after preview');
+  await assert.rejects(f.native.forceRemote(plan), /重新预览/); assert.equal(await git(f.root, 'rev-parse', 'HEAD'), old);
+  const next = await f.native.previewForceRemote(); await git(f.peer, 'commit', '--allow-empty', '-m', 'new head'); await git(f.peer, 'push');
+  await assert.rejects(f.native.forceRemote(next), /重新预览/); assert.equal(await fs.readFile(path.join(f.root, 'new.md'), 'utf8'), 'new after preview');
+});
+test('force remote leaves unrelated staged content untouched and refuses to reset it', async t => {
+  const f = await networkFixture(t); await f.write('.private.json', 'staged setting'); await git(f.root, 'add', '.private.json');
+  const index = await fs.readFile(path.join(f.root, '.git/index')), old = await git(f.root, 'rev-parse', 'HEAD');
+  await assert.rejects(f.native.previewForceRemote(), /同步范围外/);
+  assert.deepEqual(await fs.readFile(path.join(f.root, '.git/index')), index); assert.equal(await git(f.root, 'rev-parse', 'HEAD'), old);
+});
+test('an interrupted native force blocks uploads and can be re-reviewed after restarting', async t => {
+  const f = await networkFixture(t); await f.write('note.md', 'local edit');
+  await fs.writeFile(path.join(f.peer, 'note.md'), 'remote edit'); await git(f.peer, 'commit', '-am', 'remote'); await git(f.peer, 'push');
+  const realNote = path.join(await fs.realpath(f.root), 'note.md');
+  const brokenRuntime = { ...runtime, fs: { ...fs, rename: async (from: PathLike, to: PathLike) => {
+    if (String(to) === realNote) throw new Error('simulated rename failure');
+    return fs.rename(from, to);
+  } } };
+  const broken = (await NativeGit.detect(f.root, scope, brokenRuntime as typeof runtime))!;
+  await assert.rejects(broken.forceRemote(await broken.previewForceRemote()), /rename failure/);
+  assert.equal((await f.native.snapshot()).operation, 'force-remote');
+  await assert.rejects(f.native.sync('fixture'), /强制采用远端尚未完成/);
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'local edit');
+  await f.native.forceRemote(await f.native.previewForceRemote());
+  assert.equal((await f.native.snapshot()).operation, ''); assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'remote edit');
+  assert.equal((await f.native.sync('fixture')).pushed, 0);
+});
+test('force remote preserves excluded folders and ignored untracked notes', async t => {
+  const f = await networkFixture(t); f.native.scope = { ...scope, excludedFolders: ['private'] };
+  await fs.mkdir(path.join(f.root, 'private')); await f.write('private/local.md', 'private');
+  await f.write('.gitignore', 'ignored.md\n'); await f.write('ignored.md', 'ignored note'); await f.write('only.md', 'remove');
+  await f.native.forceRemote(await f.native.previewForceRemote());
+  assert.equal(await fs.readFile(path.join(f.root, 'private/local.md'), 'utf8'), 'private');
+  assert.equal(await fs.readFile(path.join(f.root, 'ignored.md'), 'utf8'), 'ignored note');
+  await assert.rejects(fs.stat(path.join(f.root, 'only.md')), { code: 'ENOENT' });
+});
+test('force remote supports SHA-256 Git object repositories', async t => {
+  let f: Awaited<ReturnType<typeof networkFixture>>;
+  try { f = await networkFixture(t, 'sha256'); }
+  catch (error) { if (/unknown.*object-format|unknown hash|unsupported.*sha256/i.test(String(error))) { t.skip('Git lacks SHA-256 repositories'); return; } throw error; }
+  await f.write('note.md', 'local'); await fs.writeFile(path.join(f.peer, 'note.md'), 'SHA-256 remote');
+  await git(f.peer, 'commit', '-am', 'sha256'); await git(f.peer, 'push');
+  const plan = await f.native.previewForceRemote(); assert.equal(plan.remoteHead.length, 64);
+  await f.native.forceRemote(plan);
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'SHA-256 remote');
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), plan.remoteHead);
+});
+test('native backup failure prevents reset or local note changes', async t => {
+  const f = await networkFixture(t); await f.write('note.md', 'keep local');
+  const old = await git(f.root, 'rev-parse', 'HEAD'), index = await fs.readFile(path.join(f.root, '.git/index'));
+  const broken = { ...runtime, fs: { ...fs, open: async () => { throw new Error('backup disk failure'); } } };
+  const native = (await NativeGit.detect(f.root, scope, broken as unknown as typeof runtime))!;
+  await assert.rejects(native.forceRemote(await native.previewForceRemote()), /backup disk failure/);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), old); assert.deepEqual(await fs.readFile(path.join(f.root, '.git/index')), index);
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'keep local');
+  assert.equal((await f.native.snapshot()).operation, '');
+});
+test('force remote refuses an active rebase without aborting it or changing the index', async t => {
+  const f = await networkFixture(t); await f.write('note.md', 'local'); await f.native.commit('local');
+  await fs.writeFile(path.join(f.peer, 'note.md'), 'remote'); await git(f.peer, 'commit', '-am', 'remote'); await git(f.peer, 'push'); await git(f.root, 'fetch');
+  await assert.rejects(git(f.root, 'rebase', 'origin/main'));
+  const head = await git(f.root, 'rev-parse', 'HEAD'), index = await fs.readFile(path.join(f.root, '.git/index'));
+  await assert.rejects(f.native.previewForceRemote(), /rebase/);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head); assert.deepEqual(await fs.readFile(path.join(f.root, '.git/index')), index);
+});
+test('native force supports an empty remote note tree and preserves every removed note in backup', async t => {
+  const f = await networkFixture(t); await f.write('only.md', 'local draft');
+  await git(f.peer, 'rm', 'note.md'); await git(f.peer, 'commit', '-m', 'remove all notes'); await git(f.peer, 'push');
+  const result = await f.native.forceRemote(await f.native.previewForceRemote());
+  await assert.rejects(fs.stat(path.join(f.root, 'note.md')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(f.root, 'only.md')), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(path.join(result.backup, 'files/only.md'), 'utf8'), 'local draft');
+  assert.equal(await fs.readFile(path.join(f.root, '.private.json'), 'utf8'), 'private base\n');
 });

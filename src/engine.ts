@@ -3,6 +3,7 @@ import {
   type Conflict, type DeletionReview, type Hash, type LocalPort, type Plan, type RemotePort,
   type RemoteSnapshot, type Scope, type StatePort, type SyncState
 } from './model';
+import { overwritePlan, type RemoteOverwritePlan, type RemoteOverwriteResult } from './force-remote';
 
 export interface SyncResult { uploaded: number; downloaded: number; conflicts: number; deferred: number }
 export class DeletionReviewError extends Error {
@@ -69,6 +70,58 @@ export class SyncEngine {
     this.running = true;
     try { return await this.preparePlan(await this.remote.snapshot()); }
     finally { this.running = false; }
+  }
+  private async forcePlan(): Promise<RemoteOverwritePlan> {
+    const state = await this.load(), snapshot = await this.remote.snapshot(), local = await this.localSnapshot();
+    return overwritePlan({ mode: 'api', source: 'GitHub 当前配置', remoteHead: snapshot.head, localHead: '', localCommits: 0, stagedPaths: [] },
+      local, snapshot.files, [this.binding, this.scope, state]);
+  }
+  async previewForceRemote(): Promise<RemoteOverwritePlan> {
+    if (this.running) throw new Error('请等待当前同步完成。');
+    this.running = true; this.state = null;
+    try { this.guard(); return await this.forcePlan(); }
+    finally { this.running = false; this.state = null; }
+  }
+  async forceRemote(expected: RemoteOverwritePlan): Promise<RemoteOverwriteResult> {
+    if (this.running) throw new Error('请等待当前同步完成。');
+    this.running = true; this.state = null;
+    try {
+      this.guard();
+      const plan = await this.forcePlan();
+      if (plan.fingerprint !== expected.fingerprint) throw new Error('本地笔记、远端或同步状态已变化，请重新预览远端覆盖。');
+      const state = this.state!, files: Array<{ path: string; sha: string }> = [];
+      for (const [path, sha] of await this.localSnapshot()) {
+        const bytes = await this.local.read(path);
+        if (bytes === null || blobHash(bytes) !== sha) throw new Error('笔记在备份时变化，请重新预览。');
+        files.push({ path, sha: await this.store.put(bytes) });
+      }
+      const previousState = await this.store.put(new TextEncoder().encode(JSON.stringify(state)));
+      const at = new Date().toISOString();
+      const backup = await this.store.put(new TextEncoder().encode(JSON.stringify({ version: 1, at, remoteHead: plan.remoteHead, previousState, files })));
+      // Download and verify every incoming object before changing local files.
+      for (const change of plan.changes) if (change.target) { this.guard(); await this.object(change.target); }
+      if ((await this.forcePlan()).fingerprint !== plan.fingerprint) throw new Error('备份期间本地或远端已变化，请重新预览。');
+      state.forceBackups = [...(state.forceBackups ?? []), { id: backup, at, remoteHead: plan.remoteHead }];
+      state.forceRemote = { backup, remoteHead: plan.remoteHead };
+      // Both checkpoint slots must retain the upload guard before local writes.
+      await this.store.save(state);
+      await this.store.save(state);
+      for (const change of plan.changes) {
+        this.guard();
+        const data = change.target === null ? null : await this.object(change.target);
+        if (!await this.local.apply(change.path, change.before, data, true)) throw new Error('覆盖期间笔记被编辑，操作已停止。请重新预览；完整备份已保留。');
+        if (change.before) this.remember(change.path, change.before, '强制采用远端前');
+      }
+      this.guard();
+      const remote = await this.remote.snapshot(), local = await this.localSnapshot();
+      if (remote.head !== plan.remoteHead || overwritePlan({ ...plan }, local, remote.files, null).changes.length) throw new Error('覆盖期间本地或远端变化，操作未完成。请重新预览；备份已保留。');
+      state.bases = Object.fromEntries(remote.files); state.lastHead = remote.head; state.approved = true;
+      state.lastSync = new Date().toISOString();
+      state.conflicts = []; state.resolutions = {};
+      delete state.pending; delete state.deletionApproval; delete state.forceRemote;
+      await this.store.save(state);
+      return { changed: plan.changes.length, backup };
+    } finally { this.running = false; this.state = null; }
   }
   private remember(path: string, sha: string, reason: string): void {
     const state = this.state!;
@@ -138,6 +191,7 @@ export class SyncEngine {
     const result: SyncResult = { uploaded: 0, downloaded: 0, conflicts: 0, deferred: 0 };
     try {
       const state = await this.load();
+      if (state.forceRemote) throw new Error('上次强制采用远端尚未完成，请重新预览远端覆盖。备份已保留，自动上传已停止。');
       if (!state.approved) throw new Error('请先在设置中预览首次同步并建立连接。');
       await this.recover(result);
       for (let attempt = 0; attempt < 3; attempt++) {

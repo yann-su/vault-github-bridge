@@ -68,6 +68,8 @@ export interface Pending {
 }
 export interface SyncState {
   schema: 1;
+  forceBackups?: Array<{ id: string; at: string; remoteHead: string }>;
+  forceRemote?: { backup: string; remoteHead: string };
   binding: string;
   approved: boolean;
   bases: Record<string, Hash>;
@@ -123,7 +125,7 @@ export interface LocalPort {
   list(): Promise<Array<{ path: string; size: number }>>;
   read(path: string): Promise<Uint8Array | null>;
   /** Must reject stale writes and preserve data before destructive changes. */
-  apply(path: string, expected: Hash, data: Uint8Array | null): Promise<boolean>;
+  apply(path: string, expected: Hash, data: Uint8Array | null, forceFocused?: boolean): Promise<boolean>;
 }
 export interface StatePort {
   load(): Promise<SyncState | null>;

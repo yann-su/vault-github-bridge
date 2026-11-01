@@ -25,6 +25,9 @@ function validateState(value: unknown, binding: string): SyncState {
     !s.resolutions || !Array.isArray(s.conflicts) || !Array.isArray(s.history)) throw new Error('同步状态版本或仓库标识不匹配。');
   const valid = (h: unknown) => h === null || (typeof h === 'string' && /^[0-9a-f]{40}$/.test(h));
   if (Object.values(s.bases).some(h => !valid(h))) throw new Error('同步基线无效。');
+  const id = (v: unknown) => typeof v === 'string' && /^[a-f\d]{40}$/.test(v);
+  if (s.forceRemote && (!id(s.forceRemote.backup) || !id(s.forceRemote.remoteHead))) throw new Error('远端覆盖日志无效。');
+  if (s.forceBackups && (!Array.isArray(s.forceBackups) || s.forceBackups.some(b => !id(b.id) || !id(b.remoteHead) || typeof b.at !== 'string'))) throw new Error('远端覆盖备份清单无效。');
   if (s.pending && (!Array.isArray(s.pending.operations) || s.pending.operations.some(op =>
     typeof op.path !== 'string' || !['push', 'pull', 'adopt'].includes(op.kind) || !valid(op.before) || !valid(op.target)))) throw new Error('恢复日志无效。');
   return s;
