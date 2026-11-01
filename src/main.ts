@@ -46,6 +46,7 @@ export default class GitHubBridgePlugin extends Plugin {
   private debounce: number | undefined;
   private nextPoll = 0;
   private blockedUntil = 0;
+  private rateLimitedUntil = 0;
   private failures = 0;
   private unloaded = false;
   private startupPending = true;
@@ -71,14 +72,15 @@ export default class GitHubBridgePlugin extends Plugin {
     this.saveQueue = new SaveSyncQueue({
       enabled: () => !this.apiNeedsReview && (this.settings.autoSync || this.launchSyncPending && this.settings.syncOnStartup) && this.configured() && !this.unloaded && !this.startupPending,
       busy: () => this.busy || this.detectingGit || document.visibilityState !== 'visible' || !navigator.onLine,
-      retryAt: () => this.blockedUntil,
+      retryAt: manual => this.retryAt(manual),
       now: () => Date.now(),
       setTimer: (callback, delay) => window.setTimeout(callback, delay),
       clearTimer: timer => window.clearTimeout(timer),
-      sync: () => this.sync(false),
+      sync: manual => this.sync(manual, false),
       pending: () => {
         window.clearTimeout(this.debounce); this.debounce = undefined;
-        this.setStatus(this.busy ? '已排队，当前同步结束后继续…' : '准备同步…');
+        const serverWait = Math.ceil((this.retryAt(true) - Date.now()) / 1000);
+        this.setStatus(this.busy ? '已排队，当前同步结束后继续…' : serverWait > 0 ? `GitHub 正在限流，约 ${serverWait} 秒后继续同步。` : '准备同步…');
       },
       error: error => {
         const message = error instanceof Error ? error.message : '保存未完成，尚未开始同步。';
@@ -125,7 +127,7 @@ export default class GitHubBridgePlugin extends Plugin {
       if (!view?.file || !view.editor.hasFocus() || !inScope(view.file.path, this.scope())) return;
       // Let Obsidian handle its normal save too; await the public save API so
       // the engine cannot read the old disk contents before the editor flushes.
-      void this.saveQueue.request(() => view.save());
+      void this.saveQueue.request(() => view.save(), true);
     }, { capture: true });
     this.registerDomEvent(document, 'visibilitychange', () => {
       if (document.visibilityState === 'visible') this.schedule(1000);
@@ -340,7 +342,11 @@ export default class GitHubBridgePlugin extends Plugin {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (view?.file && inScope(view.file.path, this.scope())) await view.save();
       });
-    }, Math.max(delay, this.blockedUntil - Date.now()));
+    }, Math.max(delay, this.retryAt(false) - Date.now()));
+  }
+  private retryAt(manual: boolean): number {
+    const server = this.nativeGit || this.nativeGitError ? 0 : this.rateLimitedUntil;
+    return manual ? server : Math.max(server, this.blockedUntil);
   }
   private async task<T>(job: () => Promise<T>): Promise<T | undefined> {
     if (this.busy || this.detectingGit) { new Notice('已有操作正在进行，请稍候。'); return; }
@@ -362,14 +368,16 @@ export default class GitHubBridgePlugin extends Plugin {
     let continueQueue = false;
     if (this.startupPending || this.unloaded) return;
     if (this.busy || this.detectingGit) { if (manual) new Notice('已有同步正在进行。'); return; }
-    if (Date.now() < this.blockedUntil) {
-      if (manual) new Notice(`请等待约 ${Math.ceil((this.blockedUntil - Date.now()) / 1000)} 秒后重试。`);
+    const retryAt = this.retryAt(manual);
+    if (Date.now() < retryAt) {
+      if (manual) new Notice(`GitHub 正在限流，约 ${Math.ceil((retryAt - Date.now()) / 1000)} 秒后可重试。`);
       return;
     }
-    if (this.launchSyncPending) {
+    if (manual || this.launchSyncPending) {
       this.launchSyncPending = false;
       window.clearTimeout(this.debounce); this.debounce = undefined;
     }
+    if (manual) this.saveQueue.clearPending();
     this.busy = true;
     try {
       if (!this.configured() && !manual) return;
@@ -387,7 +395,7 @@ export default class GitHubBridgePlugin extends Plugin {
           result.divergent ? '只接收更新：分支已分叉，请关闭只接收更新后同步以合并上游' :
           `${result.merged ? '已合并上游并同步' : '已同步'} · commit ${result.committed} ↑${result.pushed} ↓${result.pulled}`);
         const signature = result.conflicts ? JSON.stringify(['native', state.head, state.operation, state.changes.filter(c => c.conflict).map(c => c.path)]) : '';
-        if (manual && notifySuccess || !manual && signature && signature !== this.lastConflictSignature) new Notice(this.statusText, result.conflicts ? 8000 : 6000);
+        if (manual && notifySuccess || signature && signature !== this.lastConflictSignature) new Notice(this.statusText, result.conflicts ? 8000 : 6000);
         this.lastConflictSignature = signature;
         return;
       }
@@ -400,20 +408,24 @@ export default class GitHubBridgePlugin extends Plugin {
       const result = await engine.run();
       continueQueue = result.deferred > 0;
       this.failures = 0; this.blockedUntil = 0;
+      this.rateLimitedUntil = 0;
       this.setStatus(this.describe(result));
       if (manual && notifySuccess) new Notice(this.statusText, 6000);
       const signature = result.conflicts ? JSON.stringify((await engine.inspect()).conflicts.map(c => [c.path, c.local, c.remote])) : '';
-      if (!manual && signature && signature !== this.lastConflictSignature) new Notice(`GitHub：${result.conflicts} 项冲突已保留双方内容。请打开同步菜单选择“处理同步冲突”。`, 8000);
+      if (!(manual && notifySuccess) && signature && signature !== this.lastConflictSignature) new Notice(`GitHub：${result.conflicts} 项冲突已保留双方内容。请打开同步菜单选择“处理同步冲突”。`, 8000);
       this.lastConflictSignature = signature;
     } catch (error) {
       this.failures++;
-      this.blockedUntil = Date.now() + Math.max(error instanceof GitHubError ? error.retryAfterMs : 0, Math.min(900_000, 30_000 * 2 ** Math.min(this.failures - 1, 5)));
+      this.blockedUntil = Date.now() + Math.min(900_000, 30_000 * 2 ** Math.min(this.failures - 1, 5));
+      if (error instanceof GitHubError && Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + error.retryAfterMs);
+      }
       const message = error instanceof Error ? error.message : '同步失败，请稍后重试。';
       this.setStatus(message);
       if (manual) new Notice(message, 8000);
     } finally {
       this.busy = false;
-      this.nextPoll = Math.max(this.blockedUntil, Date.now() + this.settings.intervalSeconds * 1000);
+      this.nextPoll = Math.max(this.retryAt(false), Date.now() + this.settings.intervalSeconds * 1000);
       this.saveQueue.wake();
       if (continueQueue) this.schedule(this.settings.idleSeconds * 1000);
     }
