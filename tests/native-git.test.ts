@@ -39,6 +39,25 @@ async function networkFixture(t: TestContext) {
   await git(peer, 'config', 'commit.gpgsign', 'false');
   return { ...f, remote, peer };
 }
+async function pushHook(f: Awaited<ReturnType<typeof networkFixture>>, advance: 'once' | 'always' | 'never') {
+  const counter = path.join(f.dir, 'push-count'), program = path.join(f.dir, 'pre-push.mjs');
+  await fs.writeFile(program, `import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const counter = ${JSON.stringify(counter)}, peer = ${JSON.stringify(f.peer)};
+const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;
+fs.writeFileSync(counter, String(count));
+const env = { ...process.env };
+for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+const git = (...args) => execFileSync('git', ['-C', peer, ...args], { env, stdio: 'pipe' });
+if (${JSON.stringify(advance)} === 'always' || ${JSON.stringify(advance)} === 'once' && count === 1) {
+  git('commit', '--allow-empty', '-m', 'concurrent peer ' + count); git('push');
+}
+if (${JSON.stringify(advance)} === 'never') process.exit(1);
+`);
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  await fs.writeFile(path.join(f.root, '.git/hooks/pre-push'), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(program)}\n`, { mode: 0o755 });
+  return () => fs.readFile(counter, 'utf8');
+}
 
 test('detects an exact vault Git root and linked worktree, never an ancestor repository', async t => {
   const f = await fixture(t), nested = path.join(f.root, 'nested'); await fs.mkdir(nested);
@@ -85,7 +104,7 @@ test('a conflict outside note scope blocks sync before committing, fetching or p
   await assert.rejects(git(f.root, 'merge', 'other'));
   await f.write('note.md', 'uncommitted note');
   const head = await git(f.root, 'rev-parse', 'HEAD'), index = await fs.readFile(path.join(f.root, '.git', 'index'));
-  await assert.rejects(f.native.sync('test'), /未解决冲突/);
+  assert.equal((await f.native.sync('test')).conflicts, 1);
   assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head); assert.deepEqual(await fs.readFile(path.join(f.root, '.git', 'index')), index);
 });
 test('sync uses repository upstream, commits notes and pushes without API credentials', async t => {
@@ -94,17 +113,115 @@ test('sync uses repository upstream, commits notes and pushes without API creden
   assert.equal(result.committed, 1); assert.equal(result.pushed, 1);
   await git(f.peer, 'pull', '--ff-only'); assert.equal(await fs.readFile(path.join(f.peer, 'note.md'), 'utf8'), 'upload');
 });
-test('sync fast-forwards a remote update and detects divergence without rewriting commits', async t => {
+test('sync fast-forwards a remote update without creating a merge commit', async t => {
   const f = await networkFixture(t);
   await fs.writeFile(path.join(f.peer, 'peer.md'), 'download'); await git(f.peer, 'add', 'peer.md'); await git(f.peer, 'commit', '-m', 'peer'); await git(f.peer, 'push');
-  assert.equal((await f.native.sync('fixture')).pulled, 1);
-  await fs.writeFile(path.join(f.peer, 'peer.md'), 'second'); await git(f.peer, 'commit', '-am', 'peer second'); await git(f.peer, 'push');
+  const result = await f.native.sync('fixture');
+  assert.equal(result.pulled, 1); assert.equal(result.merged, false); assert.equal(result.pushed, 0);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), await git(f.peer, 'rev-parse', 'HEAD'));
+});
+test('sync automatically merges divergence and pushes both histories without rewriting commits', async t => {
+  const f = await networkFixture(t);
+  await fs.writeFile(path.join(f.peer, 'peer.md'), 'remote'); await git(f.peer, 'add', 'peer.md'); await git(f.peer, 'commit', '-m', 'peer'); await git(f.peer, 'push');
+  const remoteHead = await git(f.peer, 'rev-parse', 'HEAD');
+  // A repository preference for ff-only must not prevent the requested merge.
+  await git(f.root, 'config', 'merge.ff', 'only');
+  await git(f.root, 'config', 'branch.main.mergeOptions', '--ff-only');
   await f.write('note.md', 'local divergent');
-  const result = await f.native.sync('fixture'); assert.equal(result.divergent, true); assert.equal(result.pushed, 0);
-  const before = await git(f.root, 'rev-parse', 'HEAD');
-  await f.native.mergeUpstream();
+  const result = await f.native.sync('fixture');
+  assert.equal(result.divergent, false); assert.equal(result.merged, true); assert.equal(result.conflicts, 0);
+  assert.equal(result.committed, 1); assert.equal(result.pulled, 1); assert.equal(result.pushed, 2);
   assert.equal((await git(f.root, 'rev-list', '--parents', '-n', '1', 'HEAD')).split(' ').length, 3);
-  assert.equal(await git(f.root, 'merge-base', '--is-ancestor', before, 'HEAD'), '');
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD^2'), remoteHead);
+  assert.equal(await git(f.root, 'show', 'HEAD^1:note.md'), 'local divergent');
+  assert.equal(await fs.readFile(path.join(f.root, 'peer.md'), 'utf8'), 'remote');
+  assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), await git(f.root, 'rev-parse', 'HEAD'));
+  assert.match(await git(f.root, 'rev-list', '--left-right', '--count', 'HEAD...origin/main'), /^0\s+0$/);
+});
+test('sync merges non-overlapping edits to the same note', async t => {
+  const f = await networkFixture(t), lines = Array.from({ length: 20 }, (_, i) => `line ${i}\n`);
+  await f.write('note.md', lines.join('')); await f.native.sync('fixture'); await git(f.peer, 'pull', '--ff-only');
+  const ours = [...lines], theirs = [...lines]; ours[0] = 'local first line\n'; theirs[19] = 'remote last line\n';
+  await f.write('note.md', ours.join('')); await fs.writeFile(path.join(f.peer, 'note.md'), theirs.join(''));
+  await git(f.peer, 'commit', '-am', 'remote last line'); await git(f.peer, 'push');
+  const result = await f.native.sync('fixture'); assert.equal(result.merged, true); assert.equal(result.conflicts, 0);
+  const merged = [...lines]; merged[0] = ours[0]!; merged[19] = theirs[19]!;
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), merged.join(''));
+});
+test('automatic merge conflicts retain both versions, stop push, and resume after reviewed resolution', async t => {
+  const f = await networkFixture(t);
+  await fs.writeFile(path.join(f.peer, 'note.md'), 'remote side\n'); await git(f.peer, 'commit', '-am', 'remote side'); await git(f.peer, 'push');
+  const remoteHead = await git(f.peer, 'rev-parse', 'HEAD'); await f.write('note.md', 'local side\n');
+  const result = await f.native.sync('fixture');
+  assert.equal(result.conflicts, 1); assert.equal(result.pushed, 0); assert.equal(result.merged, false);
+  assert.equal((await f.native.snapshot()).operation, 'merge');
+  const conflict = await f.native.conflict('note.md'); assert.equal(conflict.ours, 'local side\n'); assert.equal(conflict.theirs, 'remote side\n');
+  const head = await git(f.root, 'rev-parse', 'HEAD'), index = await fs.readFile(path.join(f.root, '.git/index'));
+  assert.equal((await f.native.sync('fixture')).conflicts, 1);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head); assert.deepEqual(await fs.readFile(path.join(f.root, '.git/index')), index);
+  assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), remoteHead);
+  await f.native.resolveConflict(conflict, 'ours'); await f.native.finishMerge(await f.native.stagedReview());
+  assert.ok((await f.native.sync('fixture')).pushed > 0);
+  assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), await git(f.root, 'rev-parse', 'HEAD'));
+});
+test('automatic merge reports conflicts in tracked configuration outside note scope', async t => {
+  const f = await networkFixture(t);
+  await f.write('.private.json', 'local config'); await git(f.root, 'commit', '-am', 'local config');
+  await fs.writeFile(path.join(f.peer, '.private.json'), 'remote config'); await git(f.peer, 'commit', '-am', 'remote config'); await git(f.peer, 'push');
+  const result = await f.native.sync('fixture'); assert.equal(result.conflicts, 1); assert.equal(result.pushed, 0);
+  assert.equal((await f.native.snapshot()).changes.find(c => c.conflict)!.managed, false);
+});
+test('automatic merge preserves unrelated staged changes instead of including them in a merge commit', async t => {
+  const f = await networkFixture(t);
+  await fs.writeFile(path.join(f.peer, 'peer.md'), 'remote'); await git(f.peer, 'add', 'peer.md'); await git(f.peer, 'commit', '-m', 'remote'); await git(f.peer, 'push');
+  const remoteHead = await git(f.peer, 'rev-parse', 'HEAD');
+  await f.write('.private.json', 'private staged'); await git(f.root, 'add', '.private.json'); await f.write('note.md', 'local note');
+  await assert.rejects(f.native.sync('fixture'), /暂存区还有其他修改/);
+  assert.equal(await git(f.root, 'diff', '--cached', '--name-only'), '.private.json');
+  assert.equal(await git(f.root, 'show', 'HEAD:.private.json'), 'private base');
+  assert.equal(await git(f.root, 'show', 'HEAD:note.md'), 'local note');
+  assert.equal((await f.native.snapshot()).operation, '');
+  assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), remoteHead);
+});
+test('merge never auto-stashes or overwrites dirty tracked configuration', async t => {
+  const f = await networkFixture(t);
+  await fs.writeFile(path.join(f.peer, '.private.json'), 'remote config'); await git(f.peer, 'commit', '-am', 'remote config'); await git(f.peer, 'push');
+  await git(f.root, 'config', 'merge.autoStash', 'true');
+  await f.write('.private.json', 'unsaved local config'); await f.write('note.md', 'local note');
+  await assert.rejects(f.native.sync('fixture'), /未提交修改阻止合并：.private.json/);
+  assert.equal(await fs.readFile(path.join(f.root, '.private.json'), 'utf8'), 'unsaved local config');
+  assert.equal((await f.native.snapshot()).operation, '');
+  await assert.rejects(git(f.root, 'rev-parse', '--verify', 'refs/stash'));
+});
+test('read-only divergence creates no merge commit and never pushes', async t => {
+  const f = await networkFixture(t);
+  await f.write('note.md', 'local committed'); await f.native.commit('local'); const before = await git(f.root, 'rev-parse', 'HEAD');
+  await git(f.peer, 'commit', '--allow-empty', '-m', 'remote'); await git(f.peer, 'push');
+  const result = await f.native.sync('fixture', true);
+  assert.equal(result.divergent, true); assert.equal(result.merged, false); assert.equal(result.pushed, 0);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), before); assert.equal((await f.native.snapshot()).operation, '');
+});
+test('sync fetches and merges a concurrent peer update after a rejected push', async t => {
+  const f = await networkFixture(t), count = await pushHook(f, 'once');
+  await f.write('note.md', 'local concurrent update');
+  const result = await f.native.sync('fixture');
+  assert.equal(result.merged, true); assert.equal(result.pulled, 1); assert.equal(result.conflicts, 0);
+  assert.equal(await count(), '2'); assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), await git(f.root, 'rev-parse', 'HEAD'));
+  assert.equal(await fs.readFile(path.join(f.root, 'note.md'), 'utf8'), 'local concurrent update');
+});
+test('a push failure with unchanged upstream is reported instead of blindly retrying', async t => {
+  const f = await networkFixture(t), count = await pushHook(f, 'never'), remoteHead = await git(f.peer, 'rev-parse', 'HEAD');
+  await f.write('note.md', 'local rejected push'); await assert.rejects(f.native.sync('fixture'));
+  assert.equal(await count(), '1'); assert.equal((await f.native.snapshot()).operation, '');
+  assert.equal(await git(f.remote, 'rev-parse', 'refs/heads/main'), remoteHead);
+  assert.equal(await git(f.root, 'show', 'HEAD:note.md'), 'local rejected push');
+});
+test('continuous remote updates stop after three ordinary pushes and retain local commits', async t => {
+  const f = await networkFixture(t), count = await pushHook(f, 'always');
+  await f.write('note.md', 'local retained'); await assert.rejects(f.native.sync('fixture'));
+  assert.equal(await count(), '3'); assert.equal((await f.native.snapshot()).operation, '');
+  assert.equal(await git(f.root, 'show', 'HEAD:note.md'), 'local retained');
+  assert.equal(await git(f.remote, 'show', 'refs/heads/main:note.md'), 'base');
 });
 test('read-only sync never commits or pushes local changes', async t => {
   const f = await networkFixture(t); await f.write('note.md', 'local'); const before = await git(f.root, 'rev-parse', 'HEAD');

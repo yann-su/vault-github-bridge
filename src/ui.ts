@@ -33,7 +33,7 @@ function renderSettings(app: App, plugin: GitHubBridgePlugin, el: HTMLElement): 
   el.empty();
   const draft: BridgeSettings = { ...plugin.settings };
   el.createEl('h2', { text: 'Vault GitHub Bridge' });
-  el.createEl('p', { text: plugin.nativeGit ? '当前使用本机 Git，跟随仓库的当前分支、上游和本机凭据。自动同步仅提交同步范围内的笔记。' : '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
+  el.createEl('p', { text: plugin.nativeGit ? '当前使用本机 Git，跟随仓库的当前分支、上游和本机凭据。自动同步仅提交同步范围内的笔记；分支分叉时自动合并上游，内容冲突时保留双方版本并暂停。' : '通过 GitHub 同步笔记。请在每台设备创建本地笔记库，并分别安装本插件；不要对同一笔记库同时开启其他同步服务。' });
   if (plugin.nativeGit) new Setting(el).setName('本机 Git 仓库').setDesc(plugin.nativeGit.root)
     .addButton(b => b.setButtonText('仓库管理').onClick(() => { void plugin.showNativeRepository(); }));
   if (plugin.nativeGitError) el.createEl('p', { cls: 'github-bridge-error', text: plugin.nativeGitError });

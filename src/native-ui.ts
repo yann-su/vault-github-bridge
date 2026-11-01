@@ -33,11 +33,10 @@ export class NativeRepositoryModal extends Modal {
     action(actions, '分支管理', async () => { this.close(); await this.plugin.showNativeBranches(); });
     action(actions, '历史与版本恢复', async () => { this.close(); await this.plugin.showNativeVersions(); });
     action(actions, '处理 Git 冲突', async () => { this.close(); await this.plugin.showNativeConflicts(); });
-    if (s.ahead && s.behind) action(actions, '合并上游分支', () => {
-      new GitConfirmModal(this.app, '合并上游', `当前分支：${s.branch}\n上游：${s.upstream}\n\n将 fetch 后执行普通 merge，可能需要处理冲突。`, '开始合并', async () => {
-        this.close(); await this.plugin.nativeAction(g => g.mergeUpstream(), true);
-      }).open();
-    });
+    if (s.ahead && s.behind) {
+      el.createEl('p', { text: this.plugin.settings.readOnly ? '当前只接收更新。关闭此选项后，同步会自动尝试合并上游。' : '同步会自动合并双方修改；遇到内容冲突时保留双方版本，并暂停等待处理。' });
+      action(actions, '合并并同步上游', async () => { this.close(); await this.plugin.sync(true); }).setDisabled(this.plugin.settings.readOnly);
+    }
     action(actions, 'Git 命令行 / Shell', async () => { this.close(); this.plugin.showNativeConsole(); });
     el.createEl('pre', { cls: 'github-bridge-git-output', text: s.changes.slice(0, 400).map(c => `${c.index}${c.worktree} ${c.path}${c.oldPath ? ` ← ${c.oldPath}` : ''}`).join('\n') || '工作区干净。' });
   }
@@ -140,8 +139,9 @@ export class NativeConflictsModal extends Modal {
     if (this.state.operation) el.createEl('p', { text: `进行中的操作：${this.state.operation}` });
     if (this.state.operation === 'merge' && !conflicts.length) action(el, '查看并完成合并', async () => {
       const review = await this.plugin.nativeAction(g => g.stagedReview());
-      if (review) new GitConfirmModal(this.app, '完成 Git 合并', review.summary || '将创建合并提交。', '创建合并提交', async () => {
-        await this.plugin.nativeAction(g => g.finishMerge(review), true); this.close();
+      if (review) new GitConfirmModal(this.app, '完成 Git 合并', (review.summary || '将创建合并提交。') + '\n\n完成后继续同步到上游。', '完成合并并同步', async () => {
+        const completed = await this.plugin.nativeAction(async g => { await g.finishMerge(review); return true; }, true);
+        if (completed) { this.close(); await this.plugin.sync(true); }
       }).open();
     }).setDisabled(this.plugin.settings.readOnly);
     action(el, 'Git 命令行 / 系统终端', () => { this.close(); this.plugin.showNativeConsole(); });

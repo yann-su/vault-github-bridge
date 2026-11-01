@@ -79,6 +79,34 @@ try {
   await plugin.showSyncMenu({});
   assert.ok(plugin.nativeGit); assert.equal(plugin.apiNeedsReview, false);
   assert.equal(await git('rev-parse', 'HEAD'), head); assert.deepEqual(await readFile(join(root, '.git/index')), index);
+  const network = await mkdtemp(join(tmpdir(), 'vault-bridge-desktop-network-'));
+  try {
+    const remote = join(network, 'origin.git'), peer = join(network, 'peer');
+    const peerGit = async (...args) => (await exec('git', ['-C', peer, ...args])).stdout.trim();
+    await git('init', '--bare', remote); await git('remote', 'add', 'origin', remote); await git('push', '-u', 'origin', 'main');
+    await git('clone', '-b', 'main', remote, peer);
+    await peerGit('config', 'user.name', 'Desktop Peer'); await peerGit('config', 'user.email', 'peer@example.invalid');
+    await peerGit('config', 'commit.gpgsign', 'false');
+    await writeFile(join(peer, 'peer.md'), 'remote addition'); await peerGit('add', 'peer.md');
+    await peerGit('commit', '-m', 'remote addition'); await peerGit('push');
+    await writeFile(join(root, 'note.md'), 'local edit');
+    await plugin.sync(true);
+    assert.match(plugin.statusText, /已合并上游并同步/);
+    assert.equal(await readFile(join(root, 'peer.md'), 'utf8'), 'remote addition');
+    assert.equal((await git('rev-list', '--parents', '-n', '1', 'HEAD')).split(' ').length, 3);
+    assert.equal(await git('rev-parse', 'HEAD'), await git('rev-parse', 'origin/main'));
+    await peerGit('pull', '--ff-only');
+    await writeFile(join(peer, 'note.md'), 'remote conflict'); await peerGit('commit', '-am', 'remote conflict'); await peerGit('push');
+    const remoteHead = await peerGit('rev-parse', 'HEAD');
+    await writeFile(join(root, 'note.md'), 'local conflict');
+    await plugin.sync(false);
+    assert.match(plugin.statusText, /1 项 Git 合并冲突.*处理同步冲突/);
+    assert.equal((await plugin.nativeGit.snapshot()).operation, 'merge');
+    assert.equal((await exec('git', ['-C', remote, 'rev-parse', 'refs/heads/main'])).stdout.trim(), remoteHead);
+    await plugin.showNativeConflicts();
+    const conflict = await plugin.nativeGit.conflict('note.md');
+    assert.equal(conflict.ours, 'local conflict'); assert.equal(conflict.theirs, 'remote conflict');
+  } finally { await rm(network, { recursive: true, force: true }); }
   plugin.onunload();
-  console.log('Desktop bundle smoke passed: real Git detection through lazy Node loading, native menu and seven panels, no API settings required, HEAD/index preserved.');
+  console.log('Desktop bundle smoke passed: lazy Node/Git detection, seven panels, metadata reads preserve HEAD/index; shipped bundle merges and pushes through a real bare remote and retains both sides on conflict.');
 } finally { await rm(root, { recursive: true, force: true }); }

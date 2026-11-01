@@ -25,7 +25,10 @@ export interface GitBranch { name: string; current: boolean; remote: boolean; up
 export interface GitVersion { sha: string; date: string; subject: string; refs: string }
 export interface GitRestorePlan { sha: string; head: string; paths: string[]; deletions: string[]; fingerprint: string }
 export interface GitConflict { path: string; operation: string; fingerprint: string; ours: string | null; theirs: string | null; worktree: string | null }
-export interface GitSyncResult { committed: number; pulled: number; pushed: number; divergent: boolean; noUpstream: boolean }
+export interface GitSyncResult {
+  committed: number; pulled: number; pushed: number; merged: boolean; conflicts: number;
+  divergent: boolean; noUpstream: boolean;
+}
 export interface GitStagedReview { summary: string; fingerprint: string }
 
 export function parseGitStatus(output: string, scope: Scope): GitChange[] {
@@ -186,25 +189,74 @@ export class NativeGit {
     return commitPaths.length;
   }
   async sync(device: string, readOnly = false): Promise<GitSyncResult> {
-    let state = await this.snapshot(); this.ensureIdle(state);
-    if (!state.upstream || !state.upstreamRef || state.remote === '.') return { committed: 0, pulled: 0, pushed: 0, divergent: false, noUpstream: true };
-    let committed = 0, pulled = 0, pushed = 0;
+    let state = await this.snapshot();
+    const result: GitSyncResult = { committed: 0, pulled: 0, pushed: 0, merged: false,
+      conflicts: state.changes.filter(c => c.conflict).length, divergent: false, noUpstream: false };
+    if (result.conflicts) return result;
+    this.ensureIdle(state);
+    if (!state.upstream || !state.upstreamRef || state.remote === '.') return { ...result, noUpstream: true };
+    const target = state;
+    const checkTarget = (current: GitSnapshot) => {
+      this.ensureIdle(current);
+      if (current.branch !== target.branch || current.upstream !== target.upstream ||
+        current.remote !== target.remote || current.upstreamRef !== target.upstreamRef) {
+        throw new Error('同步期间分支或上游已变化，本轮已停止，请重新同步。');
+      }
+    };
     const deletions = state.changes.filter(c => c.managed && (c.index === 'D' || c.worktree === 'D')).length;
     const tracked = (await this.text(['ls-files', '-z'])).split('\0').filter(p => p && inScope(p, this.scope)).length;
     if (!readOnly && (deletions >= 10 || deletions >= 3 && deletions >= tracked / 2)) throw new Error('检测到批量删除，请打开“提交笔记修改”核对具体清单后提交。');
-    if (!readOnly) committed = await this.commit(`Obsidian: ${device} ${new Date().toISOString()}`);
-    await this.text(['fetch', '--prune', state.remote]);
-    state = await this.snapshot(); this.ensureIdle(state);
-    if (state.behind && state.ahead) return { committed, pulled, pushed, divergent: true, noUpstream: false };
-    if (state.behind) {
-      await this.text(['merge', '--ff-only', '--no-edit', state.upstream]);
-      pulled = state.behind;
+    if (!readOnly) result.committed = await this.commit(`Obsidian: ${device} ${new Date().toISOString()}`);
+    let rejectedPush: { upstream: string; error: unknown } | undefined;
+    // Another device can publish between fetch and push. Retry only when the
+    // actual upstream advanced; credentials, hooks and network failures surface.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.text(['fetch', '--prune', target.remote]);
+      state = await this.snapshot(); checkTarget(state);
+      const upstream = await this.resolveVersion(state.upstream);
+      if (rejectedPush && rejectedPush.upstream === upstream) throw rejectedPush.error;
+      if (state.behind) {
+        if (readOnly && state.ahead) return { ...result, divergent: true };
+        try { await this.mergeFetchedUpstream(state, readOnly || !state.ahead); }
+        catch (error) {
+          const stopped = await this.snapshot();
+          const conflicts = stopped.changes.filter(c => c.conflict).length;
+          if (conflicts) return { ...result, conflicts };
+          if (stopped.operation === 'merge') throw new Error('上游合并尚未完成，请打开“处理同步冲突”核对并完成合并。\n' + (error instanceof Error ? error.message : 'Git 合并失败。'));
+          throw error;
+        }
+        result.pulled += state.behind;
+        result.merged ||= Boolean(state.ahead);
+      }
+      state = await this.snapshot(); checkTarget(state);
+      if (readOnly || !state.ahead) return result;
+      try {
+        await this.text(['push', state.remote, `HEAD:${state.upstreamRef}`]);
+        result.pushed = state.ahead;
+        return result;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        rejectedPush = { upstream, error };
+      }
     }
-    state = await this.snapshot();
-    if (!readOnly && state.ahead) {
-      await this.text(['push', state.remote, `HEAD:${state.upstreamRef}`]); pushed = state.ahead;
+    return result;
+  }
+  private async mergeFetchedUpstream(state: GitSnapshot, ffOnly = false): Promise<void> {
+    this.ensureIdle(state);
+    if (!ffOnly && state.changes.some(c => c.index !== ' ' && c.index !== '?')) {
+      throw new Error('暂存区还有其他修改，请先在“提交笔记修改”中核对并提交，或在终端取消暂存，再合并上游。');
     }
-    return { committed, pulled, pushed, divergent: false, noUpstream: false };
+    const dirty = state.changes.filter(c => c.index !== '?');
+    if (dirty.length) {
+      const incoming = new Set((await this.text(['diff', '--name-only', '--no-renames', '-z', `HEAD...${state.upstream}`])).split('\0'));
+      const overlap = dirty.filter(c => incoming.has(c.path) || c.oldPath && incoming.has(c.oldPath));
+      if (overlap.length) throw new Error(`未提交修改阻止合并：${overlap.slice(0, 5).map(c => c.path).join('、')}。请先在终端提交或 stash 这些修改，再同步。笔记和双方提交均已保留。`);
+    }
+    // Never stash a user's working files or apply an old cached resolution.
+    // Explicit flags also override repository ff-only / no-commit preferences.
+    await this.text(['-c', 'merge.autoStash=false', '-c', 'rerere.enabled=false',
+      '-c', `branch.${state.branch}.mergeOptions=`, 'merge', '--no-edit', '--commit', '--no-squash',
+      ffOnly ? '--ff-only' : '--ff', state.upstream]);
   }
   async branches(): Promise<GitBranch[]> {
     return (await this.text(['for-each-ref', '--format=%(refname)%00%(HEAD)%00%(upstream:short)', 'refs/heads', 'refs/remotes'])).split('\n').filter(Boolean).flatMap(line => {
@@ -254,7 +306,9 @@ export class NativeGit {
     if (!state.upstream) throw new Error('当前分支没有上游。');
     if (state.changes.some(c => c.managed)) throw new Error('请先提交笔记修改，再合并上游。');
     await this.text(['fetch', state.remote]);
-    await this.text(['merge', '--no-edit', state.upstream]);
+    const fresh = await this.snapshot();
+    if (fresh.branch !== state.branch || fresh.upstream !== state.upstream) throw new Error('分支或上游已变化，请刷新后重试。');
+    await this.mergeFetchedUpstream(fresh, !fresh.ahead);
   }
   async versions(): Promise<GitVersion[]> {
     if (!(await this.optional(['rev-parse', '--verify', 'HEAD']))) return [];

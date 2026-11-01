@@ -1,6 +1,6 @@
 {
   "name": "vault-github-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Obsidian sync with native Git repository management and a cross-platform GitHub API backend.",
   "private": true,
   "type": "module",

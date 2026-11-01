@@ -248,7 +248,7 @@ export default class GitHubBridgePlugin extends Plugin {
       if (write) await this.saveActiveEditor();
       const result = await job(this.nativeGit);
       this.nativeBranch = (await this.nativeGit.snapshot()).branch;
-      if (write) this.setStatus('Git 操作已完成');
+      if (write) { this.failures = 0; this.blockedUntil = 0; this.setStatus('Git 操作已完成'); }
       return result;
     });
   }
@@ -379,10 +379,16 @@ export default class GitHubBridgePlugin extends Plugin {
         await this.saveActiveEditor();
         this.setStatus('正在通过本机 Git 同步…');
         const result = await this.nativeGit.sync(this.settings.device, this.settings.readOnly);
-        this.nativeBranch = (await this.nativeGit.snapshot()).branch;
+        const state = await this.nativeGit.snapshot();
+        this.nativeBranch = state.branch;
         this.failures = 0; this.blockedUntil = 0;
-        this.setStatus(result.noUpstream ? '当前分支未设置上游，请到分支管理发布或跟踪分支' : result.divergent ? '分支已分叉，请到仓库管理合并上游' : `已同步 · commit ${result.committed} ↑${result.pushed} ↓${result.pulled}`);
-        if (manual && notifySuccess) new Notice(this.statusText, 6000);
+        this.setStatus(result.conflicts ? `${result.conflicts} 项 Git 合并冲突，已保留双方版本；请打开“处理同步冲突”` :
+          result.noUpstream ? '当前分支未设置上游，请到分支管理发布或跟踪分支' :
+          result.divergent ? '只接收更新：分支已分叉，请关闭只接收更新后同步以合并上游' :
+          `${result.merged ? '已合并上游并同步' : '已同步'} · commit ${result.committed} ↑${result.pushed} ↓${result.pulled}`);
+        const signature = result.conflicts ? JSON.stringify(['native', state.head, state.operation, state.changes.filter(c => c.conflict).map(c => c.path)]) : '';
+        if (manual && notifySuccess || !manual && signature && signature !== this.lastConflictSignature) new Notice(this.statusText, result.conflicts ? 8000 : 6000);
+        this.lastConflictSignature = signature;
         return;
       }
       const { engine } = this.getContext();
