@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdtemp, rm, realpath, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, mkdir, rm, realpath, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -14,13 +14,15 @@ const git = async (...args) => (await exec('git', ['-C', root, ...args])).stdout
 try {
   await git('init', '-b', 'main'); await git('config', 'user.name', 'Desktop Test');
   await git('config', 'user.email', 'desktop@example.invalid'); await git('config', 'commit.gpgsign', 'false');
-  await writeFile(join(root, 'note.md'), 'fixture'); await git('add', 'note.md'); await git('commit', '-m', 'fixture');
+  await writeFile(join(root, 'note.md'), 'fixture');
+  await mkdir(join(root, '.obsidian')); await writeFile(join(root, '.obsidian/workspace.json'), '{"layout":"base"}');
+  await git('add', 'note.md', '.obsidian/workspace.json'); await git('commit', '-m', 'fixture');
   const head = await git('rev-parse', 'HEAD'), index = await readFile(join(root, '.git/index'));
-  const modalTitles = [], commands = [], menus = [], settingNames = [];
+  const modalTitles = [], commands = [], menus = [], settingNames = [], buttons = [];
   const element = () => ({ empty() {}, addClass() {}, addEventListener() {}, setText() {}, setAttribute() {}, createEl: () => element(), createDiv: () => element(), getBoundingClientRect: () => ({ right: 10, bottom: 20 }) });
   class Control {
     setValue() { return this; } setPlaceholder() { return this; } onChange() { return this; }
-    setButtonText() { return this; } setDisabled() { return this; } onClick() { return this; }
+    setButtonText(label) { this.label = label; return this; } setDisabled() { return this; } onClick(callback) { this.click = callback; buttons.push(this); return this; }
     setCta() { return this; } addOption() { return this; }
   }
   class Setting {
@@ -87,11 +89,21 @@ try {
     await git('clone', '-b', 'main', remote, peer);
     await peerGit('config', 'user.name', 'Desktop Peer'); await peerGit('config', 'user.email', 'peer@example.invalid');
     await peerGit('config', 'commit.gpgsign', 'false');
-    await writeFile(join(peer, 'peer.md'), 'remote addition'); await peerGit('add', 'peer.md');
+    await writeFile(join(peer, 'peer.md'), 'remote addition');
+    await writeFile(join(peer, '.obsidian/workspace.json'), '{"layout":"remote"}');
+    await peerGit('add', 'peer.md', '.obsidian/workspace.json');
     await peerGit('commit', '-m', 'remote addition'); await peerGit('push');
     await writeFile(join(root, 'note.md'), 'local edit');
+    await writeFile(join(root, '.obsidian/workspace.json'), '{"layout":"running app"}');
     await plugin.sync(true);
+    assert.match(plugin.statusText, /修复布局文件并同步/);
+    await plugin.showNativeRepository();
+    await buttons.findLast(b => b.label === '修复布局文件并同步').click();
+    assert.equal(modalTitles.at(-1), '将工作区布局保留在本机');
+    await buttons.findLast(b => b.label === '备份布局并修复同步').click();
     assert.match(plugin.statusText, /已合并上游并同步/);
+    assert.equal(await readFile(join(root, '.obsidian/workspace.json'), 'utf8'), '{"layout":"running app"}');
+    assert.equal(await git('ls-files', '--', '.obsidian/workspace.json'), '');
     assert.equal(await readFile(join(root, 'peer.md'), 'utf8'), 'remote addition');
     assert.equal((await git('rev-list', '--parents', '-n', '1', 'HEAD')).split(' ').length, 3);
     assert.equal(await git('rev-parse', 'HEAD'), await git('rev-parse', 'origin/main'));
@@ -108,5 +120,5 @@ try {
     assert.equal(conflict.ours, 'local conflict'); assert.equal(conflict.theirs, 'remote conflict');
   } finally { await rm(network, { recursive: true, force: true }); }
   plugin.onunload();
-  console.log('Desktop bundle smoke passed: lazy Node/Git detection, seven panels, metadata reads preserve HEAD/index; shipped bundle merges and pushes through a real bare remote and retains both sides on conflict.');
+  console.log('Desktop bundle smoke passed: lazy Node/Git detection, seven panels, metadata reads preserve HEAD/index; workspace repair buttons preserve running app JSON, merge notes and push through a real bare remote; genuine note conflicts retain both sides.');
 } finally { await rm(root, { recursive: true, force: true }); }

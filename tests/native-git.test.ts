@@ -58,6 +58,17 @@ if (${JSON.stringify(advance)} === 'never') process.exit(1);
   await fs.writeFile(path.join(f.root, '.git/hooks/pre-push'), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(program)}\n`, { mode: 0o755 });
   return () => fs.readFile(counter, 'utf8');
 }
+async function trackedLayouts(f: Awaited<ReturnType<typeof networkFixture>>, dir = '.obsidian') {
+  f.native.scope = { ...scope, configDir: dir };
+  await fs.mkdir(path.join(f.root, dir), { recursive: true });
+  await f.write(`${dir}/workspace.json`, '{"layout":"base"}\n');
+  await f.write(`${dir}/workspace-mobile.json`, '{"mobile":"base"}\n');
+  await f.write(`${dir}/app.json`, '{"setting":"base"}\n');
+  await f.write('.gitignore', 'existing-ignore/\n');
+  await git(f.root, 'add', dir, '.gitignore'); await git(f.root, 'commit', '-m', 'tracked layouts'); await git(f.root, 'push');
+  await git(f.peer, 'pull', '--ff-only');
+  return `${dir}/workspace.json`;
+}
 
 test('detects an exact vault Git root and linked worktree, never an ancestor repository', async t => {
   const f = await fixture(t), nested = path.join(f.root, 'nested'); await fs.mkdir(nested);
@@ -192,6 +203,100 @@ test('merge never auto-stashes or overwrites dirty tracked configuration', async
   assert.equal(await fs.readFile(path.join(f.root, '.private.json'), 'utf8'), 'unsaved local config');
   assert.equal((await f.native.snapshot()).operation, '');
   await assert.rejects(git(f.root, 'rev-parse', '--verify', 'refs/stash'));
+});
+test('workspace repair backs up and untracks layouts while retaining local bytes, notes and other settings', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.write(layout, '{"layout":"current local"}\n'); await f.write('note.md', 'not committed by repair');
+  const backup = await f.native.keepWorkspaceLocal();
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"current local"}\n');
+  assert.equal(await git(f.root, 'ls-files', '--', layout, '.obsidian/workspace-mobile.json'), '');
+  assert.equal(await git(f.root, 'show', 'HEAD:note.md'), 'base');
+  assert.equal(await git(f.root, 'show', 'HEAD:.obsidian/app.json'), '{"setting":"base"}');
+  const ignore = await fs.readFile(path.join(f.root, '.gitignore'), 'utf8');
+  assert.equal(ignore, 'existing-ignore/\n/.obsidian/workspace.json\n/.obsidian/workspace-mobile.json\n');
+  const manifest = JSON.parse(await fs.readFile(path.join(backup, 'manifest.json'), 'utf8'));
+  assert.ok(manifest.files.find((x: { path: string }) => x.path === layout).blob);
+  assert.equal(await fs.readFile(path.join(backup, 'files', layout), 'utf8'), '{"layout":"current local"}\n');
+  assert.equal(await git(f.root, 'config', '--local', '--get', 'vaultBridge.localWorkspaceDir'), '.obsidian');
+  const head = await git(f.root, 'rev-parse', 'HEAD'); await f.native.keepWorkspaceLocal();
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head, 'repeated repair creates no extra commit');
+});
+test('workspace repair refuses unrelated staged changes without altering the index or files', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.write('.private.json', 'staged elsewhere'); await git(f.root, 'add', '.private.json');
+  const head = await git(f.root, 'rev-parse', 'HEAD'), index = await fs.readFile(path.join(f.root, '.git/index'));
+  await assert.rejects(f.native.keepWorkspaceLocal(), /暂存区已有修改/);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head); assert.deepEqual(await fs.readFile(path.join(f.root, '.git/index')), index);
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"base"}\n');
+});
+test('workspace repair refuses an edited ignore file instead of committing unrelated ignore rules', async t => {
+  const f = await networkFixture(t); await trackedLayouts(f);
+  await f.write('.gitignore', 'uncommitted-ignore/\n'); const head = await git(f.root, 'rev-parse', 'HEAD');
+  await assert.rejects(f.native.keepWorkspaceLocal(), /gitignore 有未提交修改/);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), head);
+  assert.equal(await fs.readFile(path.join(f.root, '.gitignore'), 'utf8'), 'uncommitted-ignore/\n');
+});
+test('repair resolves dirty layout divergence and merges every upstream note and setting without touching local layout', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.write(layout, '{"layout":"local committed"}\n'); await git(f.root, 'commit', '-am', 'local layout');
+  await f.write(layout, '{"layout":"live app"}\n'); await f.write('note.md', 'local note edit');
+  await fs.writeFile(path.join(f.peer, layout), '{"layout":"peer"}\n');
+  await fs.writeFile(path.join(f.peer, 'peer.md'), 'remote note'); await fs.writeFile(path.join(f.peer, '.obsidian/app.json'), '{"setting":"remote"}\n');
+  await git(f.peer, 'add', '.'); await git(f.peer, 'commit', '-m', 'remote layout, note and setting'); await git(f.peer, 'push');
+  const remoteHead = await git(f.peer, 'rev-parse', 'HEAD');
+  await assert.rejects(f.native.sync('fixture'), /修复布局文件并同步/);
+  await f.native.keepWorkspaceLocal(); const result = await f.native.sync('fixture');
+  assert.equal(result.merged, true); assert.equal(result.conflicts, 0); assert.ok(result.pushed > 0);
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"live app"}\n');
+  assert.equal(await fs.readFile(path.join(f.root, 'peer.md'), 'utf8'), 'remote note');
+  assert.equal(await fs.readFile(path.join(f.root, '.obsidian/app.json'), 'utf8'), '{"setting":"remote"}\n');
+  assert.equal(await git(f.remote, 'show', 'refs/heads/main:note.md'), 'local note edit');
+  assert.equal(await git(f.root, 'merge-base', '--is-ancestor', remoteHead, 'HEAD'), '');
+  assert.equal(await git(f.remote, 'ls-tree', '-r', '--name-only', 'refs/heads/main', '--', layout), '');
+  assert.match(await git(f.root, 'rev-list', '--left-right', '--count', 'HEAD...origin/main'), /^0\s+0$/);
+});
+test('workspace repair does not hide genuine note conflicts or overwrite running app layouts', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.write(layout, '{"layout":"running app"}\n'); await f.write('note.md', 'local content');
+  await fs.writeFile(path.join(f.peer, layout), '{"layout":"peer"}\n'); await fs.writeFile(path.join(f.peer, 'note.md'), 'peer content');
+  await git(f.peer, 'commit', '-am', 'remote layout and conflicting note'); await git(f.peer, 'push');
+  await f.native.keepWorkspaceLocal(); const result = await f.native.sync('fixture');
+  assert.equal(result.conflicts, 1); assert.equal(result.pushed, 0);
+  assert.deepEqual((await f.native.snapshot()).changes.filter(c => c.conflict).map(c => c.path), ['note.md']);
+  assert.equal((await f.native.conflict('note.md')).theirs, 'peer content');
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"running app"}\n');
+});
+test('later remote layout reintroduction is kept out of the working tree; read-only mode creates no repair commit', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.native.keepWorkspaceLocal(); await f.native.sync('fixture'); await git(f.peer, 'pull', '--ff-only');
+  await fs.mkdir(path.dirname(path.join(f.peer, layout)), { recursive: true });
+  await fs.writeFile(path.join(f.peer, layout), '{"layout":"legacy client"}\n');
+  await git(f.peer, 'add', '-f', layout); await git(f.peer, 'commit', '-m', 'legacy layout'); await git(f.peer, 'push');
+  await f.write(layout, '{"layout":"keep current"}\n'); const before = await git(f.root, 'rev-parse', 'HEAD');
+  await assert.rejects(f.native.sync('fixture', true), /关闭只接收更新/);
+  assert.equal(await git(f.root, 'rev-parse', 'HEAD'), before);
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"keep current"}\n');
+  const result = await f.native.sync('fixture'); assert.ok(result.pushed > 0); assert.equal(result.conflicts, 0);
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"keep current"}\n');
+  assert.equal(await git(f.root, 'ls-files', '--', layout), '');
+});
+test('workspace repair respects custom config directories and escapes Git ignore patterns', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f, 'config [local]');
+  await f.native.keepWorkspaceLocal();
+  assert.equal(await git(f.root, 'check-ignore', '--', layout), layout);
+  assert.equal(await fs.readFile(path.join(f.root, layout), 'utf8'), '{"layout":"base"}\n');
+  assert.equal(await git(f.root, 'ls-files', '--', layout), '');
+});
+test('another desktop repairs before receiving layout removals so its own workspace is not deleted', async t => {
+  const f = await networkFixture(t), layout = await trackedLayouts(f);
+  await f.native.keepWorkspaceLocal(); await f.native.sync('fixture');
+  const peer = (await NativeGit.detect(f.peer, scope, runtime))!;
+  await assert.rejects(peer.sync('peer'), /上游已停止跟踪工作区布局/);
+  assert.equal(await fs.readFile(path.join(f.peer, layout), 'utf8'), '{"layout":"base"}\n');
+  await peer.keepWorkspaceLocal(); const result = await peer.sync('peer');
+  assert.equal(result.conflicts, 0);
+  assert.equal(await fs.readFile(path.join(f.peer, layout), 'utf8'), '{"layout":"base"}\n');
+  assert.equal(await git(f.peer, 'ls-files', '--', layout), '');
 });
 test('read-only divergence creates no merge commit and never pushes', async t => {
   const f = await networkFixture(t);

@@ -88,10 +88,11 @@ export class NativeGit {
     return new NativeGit(git.root, gitDir, scope, runtime, executable);
   }
   cancel(): void { this.cancelled = true; for (const child of this.children) child.kill(); }
-  private async raw(args: string[], discovery = false, input?: Uint8Array): Promise<Uint8Array> {
+  private async raw(args: string[], discovery = false, input?: Uint8Array, indexFile?: string): Promise<Uint8Array> {
     if (this.cancelled) throw new Error('Git 操作已取消。');
     const env = { ...this.runtime.process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never', GIT_EDITOR: 'true', GIT_OPTIONAL_LOCKS: '0' };
     for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[key as keyof typeof env];
+    if (indexFile) Object.assign(env, { GIT_INDEX_FILE: indexFile });
     const argv = discovery ? args : ['--literal-pathspecs', `--git-dir=${this.gitDir}`, `--work-tree=${this.root}`, '-c', 'core.fsmonitor=false', ...args];
     return new Promise((resolve, reject) => {
       const child = this.runtime.child.execFile(this.executable, argv, { cwd: this.root, env, encoding: 'buffer',
@@ -105,8 +106,8 @@ export class NativeGit {
       child.stdin?.end(input);
     });
   }
-  private async text(args: string[], discovery = false, input?: Uint8Array): Promise<string> {
-    return new TextDecoder().decode(await this.raw(args, discovery, input));
+  private async text(args: string[], discovery = false, input?: Uint8Array, indexFile?: string): Promise<string> {
+    return new TextDecoder().decode(await this.raw(args, discovery, input, indexFile));
   }
   private async optional(args: string[]): Promise<string> { try { return (await this.text(args)).trim(); } catch { return ''; } }
   private pathInput(paths: string[]): Uint8Array {
@@ -217,7 +218,7 @@ export class NativeGit {
       if (rejectedPush && rejectedPush.upstream === upstream) throw rejectedPush.error;
       if (state.behind) {
         if (readOnly && state.ahead) return { ...result, divergent: true };
-        try { await this.mergeFetchedUpstream(state, readOnly || !state.ahead); }
+        try { await this.mergeFetchedUpstream(state, readOnly || !state.ahead, !readOnly); }
         catch (error) {
           const stopped = await this.snapshot();
           const conflicts = stopped.changes.filter(c => c.conflict).length;
@@ -241,22 +242,101 @@ export class NativeGit {
     }
     return result;
   }
-  private async mergeFetchedUpstream(state: GitSnapshot, ffOnly = false): Promise<void> {
+  private workspacePaths(): string[] {
+    const paths = ['workspace.json', 'workspace-mobile.json'].map(name => `${this.scope.configDir}/${name}`);
+    this.pathInput(paths);
+    return paths;
+  }
+  private async layoutFilesAt(version: string): Promise<string[]> {
+    return (await this.text(['ls-tree', '-r', '--name-only', '-z', version, '--', ...this.workspacePaths()])).split('\0').filter(Boolean);
+  }
+  // Make a child of the fetched commit that removes only workspace layouts.
+  // An isolated index keeps the real index and running app's JSON untouched.
+  // Merging this child retains every upstream note and the original history.
+  private async withoutWorkspace(parent: string): Promise<string> {
+    const folder = await this.runtime.fs.mkdtemp(this.runtime.path.join(this.gitDir, 'vault-bridge-index-'));
+    const index = this.runtime.path.join(folder, 'index');
+    try {
+      await this.text(['read-tree', parent], false, undefined, index);
+      await this.text(['update-index', '--force-remove', '--', ...this.workspacePaths()], false, undefined, index);
+      const tree = (await this.text(['write-tree'], false, undefined, index)).trim();
+      return (await this.text(['commit-tree', tree, '-p', parent, '-m', 'Keep Obsidian workspace layouts local'])).trim();
+    } finally { await this.runtime.fs.rm(folder, { recursive: true, force: true }); }
+  }
+  async keepWorkspaceLocal(): Promise<string> {
+    const state = await this.snapshot(); this.ensureIdle(state);
+    if (!state.head) throw new Error('请先为仓库创建初始提交。');
+    if (state.changes.some(c => c.index !== ' ' && c.index !== '?')) throw new Error('暂存区已有修改，请先核对并提交或取消暂存，再修复布局同步。');
+    if (state.changes.some(c => c.path === '.gitignore')) throw new Error('.gitignore 有未提交修改，请先处理后再修复布局同步。');
+    const paths = this.workspacePaths(), tracked = await this.layoutFilesAt(state.head);
+    const read = async (file: string): Promise<Uint8Array | null> => {
+      await this.checkParents(file);
+      try {
+        const full = this.runtime.path.join(this.root, file), stat = await this.runtime.fs.lstat(full);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`请先处理非常规布局或忽略文件：${file}`);
+        return new Uint8Array(await this.runtime.fs.readFile(full));
+      } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+    };
+    const review = await this.stagedReview(), ignore = await read('.gitignore');
+    const snapshots = await Promise.all(paths.map(async file => ({ file, bytes: await read(file) })));
+    const parent = this.runtime.path.join(this.gitDir, 'vault-bridge-backups');
+    await this.runtime.fs.mkdir(parent, { recursive: true });
+    const backup = await this.runtime.fs.mkdtemp(this.runtime.path.join(parent, 'workspace-'));
+    for (const item of [{ file: '.gitignore', bytes: ignore }, ...snapshots]) if (item.bytes !== null) {
+      const destination = this.runtime.path.join(backup, 'files', item.file);
+      await this.runtime.fs.mkdir(this.runtime.path.dirname(destination), { recursive: true });
+      await this.runtime.fs.writeFile(destination, item.bytes, { mode: 0o600 });
+    }
+    await this.runtime.fs.writeFile(this.runtime.path.join(backup, 'manifest.json'), JSON.stringify({ head: state.head,
+      files: [{ file: '.gitignore', bytes: ignore }, ...snapshots].map(s => ({ path: s.file, blob: s.bytes === null ? null : blobHash(s.bytes) })) }), { mode: 0o600 });
+    const current = await this.snapshot(); this.ensureIdle(current);
+    const nowIgnore = await read('.gitignore');
+    if (current.branch !== state.branch || (await this.stagedReview()).fingerprint !== review.fingerprint ||
+      (nowIgnore === null ? null : blobHash(nowIgnore)) !== (ignore === null ? null : blobHash(ignore))) throw new Error('仓库或 .gitignore 在备份时变化，请重新修复。');
+    const old = ignore === null ? '' : new TextDecoder('utf-8', { fatal: true }).decode(ignore);
+    const escape = (file: string) => file.replaceAll('*', '\\*').replaceAll('?', '\\?').replaceAll('[', '\\[').replaceAll(']', '\\]').replaceAll(' ', '\\ ');
+    const rules = paths.map(file => '/' + escape(file)).filter(rule => !old.split(/\r?\n/).includes(rule));
+    if (rules.length) {
+      const newline = old.includes('\r\n') ? '\r\n' : '\n';
+      await this.runtime.fs.writeFile(this.runtime.path.join(this.root, '.gitignore'), old + (old && !old.endsWith('\n') ? newline : '') + rules.join(newline) + newline);
+      await this.text(['add', '--', '.gitignore']);
+    }
+    if (tracked.length) await this.text(['rm', '--cached', '--', ...tracked]);
+    if (rules.length || tracked.length) {
+      const staged = (await this.text(['diff', '--cached', '--name-only', '--no-renames', '-z'])).split('\0').filter(Boolean);
+      if (staged.some(p => p !== '.gitignore' && !paths.includes(p))) throw new Error('暂存区出现其他修改，请核对后再提交布局修复。');
+      await this.text(['commit', '-m', 'Keep Obsidian workspace layouts local']);
+    }
+    await this.text(['config', '--local', 'vaultBridge.localWorkspaceDir', this.scope.configDir]);
+    return backup;
+  }
+  private async mergeFetchedUpstream(state: GitSnapshot, ffOnly = false, allowLayoutCommit = true): Promise<void> {
     this.ensureIdle(state);
     if (!ffOnly && state.changes.some(c => c.index !== ' ' && c.index !== '?')) {
       throw new Error('暂存区还有其他修改，请先在“提交笔记修改”中核对并提交，或在终端取消暂存，再合并上游。');
     }
+    let upstream = await this.resolveVersion(state.upstream);
+    const localLayouts = await this.optional(['config', '--local', '--get', 'vaultBridge.localWorkspaceDir']);
+    const here = await this.layoutFilesAt(state.head), there = await this.layoutFilesAt(upstream);
+    if (here.some(file => !there.includes(file))) throw new Error('上游已停止跟踪工作区布局。请先在“Git 仓库管理”选择“修复布局文件并同步”，保留本机布局后再同步。');
+    if (localLayouts === this.scope.configDir && !here.length && there.length) {
+      if (!allowLayoutCommit) throw new Error('上游仍跟踪工作区布局。请关闭只接收更新，再同步以保留本机布局。');
+      upstream = await this.withoutWorkspace(upstream);
+    }
     const dirty = state.changes.filter(c => c.index !== '?');
     if (dirty.length) {
-      const incoming = new Set((await this.text(['diff', '--name-only', '--no-renames', '-z', `HEAD...${state.upstream}`])).split('\0'));
+      const incoming = new Set((await this.text(['diff', '--name-only', '--no-renames', '-z', `HEAD...${upstream}`])).split('\0'));
       const overlap = dirty.filter(c => incoming.has(c.path) || c.oldPath && incoming.has(c.oldPath));
-      if (overlap.length) throw new Error(`未提交修改阻止合并：${overlap.slice(0, 5).map(c => c.path).join('、')}。请先在终端提交或 stash 这些修改，再同步。笔记和双方提交均已保留。`);
+      if (overlap.length) {
+        const layout = overlap.some(c => this.workspacePaths().includes(c.path));
+        throw new Error(`未提交修改阻止合并：${overlap.slice(0, 5).map(c => c.path).join('、')}。${layout ? '请打开“Git 仓库管理”，选择“修复布局文件并同步”。' : '请先在终端提交或 stash 这些修改，再同步。'}笔记和双方提交均已保留。`);
+      }
     }
     // Never stash a user's working files or apply an old cached resolution.
     // Explicit flags also override repository ff-only / no-commit preferences.
     await this.text(['-c', 'merge.autoStash=false', '-c', 'rerere.enabled=false',
       '-c', `branch.${state.branch}.mergeOptions=`, 'merge', '--no-edit', '--commit', '--no-squash',
-      ffOnly ? '--ff-only' : '--ff', state.upstream]);
+      ffOnly ? '--ff-only' : '--ff', upstream]);
   }
   async branches(): Promise<GitBranch[]> {
     return (await this.text(['for-each-ref', '--format=%(refname)%00%(HEAD)%00%(upstream:short)', 'refs/heads', 'refs/remotes'])).split('\n').filter(Boolean).flatMap(line => {

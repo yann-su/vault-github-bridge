@@ -37,6 +37,15 @@ export class NativeRepositoryModal extends Modal {
       el.createEl('p', { text: this.plugin.settings.readOnly ? '当前只接收更新。关闭此选项后，同步会自动尝试合并上游。' : '同步会自动合并双方修改；遇到内容冲突时保留双方版本，并暂停等待处理。' });
       action(actions, '合并并同步上游', async () => { this.close(); await this.plugin.sync(true); }).setDisabled(this.plugin.settings.readOnly);
     }
+    action(actions, '修复布局文件并同步', () => {
+      const dir = this.app.vault.configDir;
+      new GitConfirmModal(this.app, '将工作区布局保留在本机',
+        `布局文件：${dir}/workspace.json、${dir}/workspace-mobile.json\n\n先备份现有布局，再停止 Git 跟踪并写入 .gitignore。本机文件保留，GitHub 中不再同步这些布局。会创建提交，并继续合并和同步笔记；原有历史保留。\n\n暂存区和 .gitignore 如有未提交修改，会先停止以便核对。`,
+        '备份布局并修复同步', async () => {
+          const backup = await this.plugin.nativeAction(g => g.keepWorkspaceLocal(), true);
+          if (backup) { this.close(); new Notice('已保留本机布局并备份：' + backup, 8000); await this.plugin.sync(true); }
+        }).open();
+    }).setDisabled(this.plugin.settings.readOnly || Boolean(s.operation) || s.changes.some(c => c.conflict));
     action(actions, 'Git 命令行 / Shell', async () => { this.close(); this.plugin.showNativeConsole(); });
     el.createEl('pre', { cls: 'github-bridge-git-output', text: s.changes.slice(0, 400).map(c => `${c.index}${c.worktree} ${c.path}${c.oldPath ? ` ← ${c.oldPath}` : ''}`).join('\n') || '工作区干净。' });
   }
